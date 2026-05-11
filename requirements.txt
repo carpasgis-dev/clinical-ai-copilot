@@ -1,0 +1,21 @@
+# Clinical Evidence Copilot — dependencies v1
+# Pin minor versions; no patch pins for flexibility.
+
+# --- Core schemas & validation ---
+pydantic>=2.0,<3.0
+
+# --- Orchestration ---
+langgraph>=0.1.0
+langchain-core>=0.1.0
+
+# --- API ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-dotenv>=1.0.0
+
+# --- HTTP client (PubMed E-utilities, Unpaywall) ---
+httpx>=0.27.0
+
+# --- Testing ---
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
