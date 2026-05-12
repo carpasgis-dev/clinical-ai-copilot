@@ -31,6 +31,7 @@ def test_post_query_smoke(api_client) -> None:
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["route"] == "evidence"
+    assert data.get("sql_result") is None
     assert data["session_id"] == "api-test-1"
     assert "final_answer" in data
     assert data["trace"]
@@ -72,6 +73,7 @@ def test_health(api_client) -> None:
     assert "copilot_evidence_backend" in data
     assert data.get("clinical_db_loaded") in ("true", "false")
     assert "clinical_db_path" in data
+    assert "copilot_llm_profile" in data
 
 
 def test_root(api_client) -> None:
@@ -81,3 +83,23 @@ def test_root(api_client) -> None:
     data = r.json()
     assert data["docs"] == "/docs"
     assert "query" in data
+
+
+def test_post_query_sql_includes_executed_query(api_client) -> None:
+    """Ruta SQL: la respuesta HTTP debe incluir el SELECT ejecutado (auditoría)."""
+    client, _ = api_client
+    r = client.post(
+        "/query",
+        json={
+            "query": "cuantos pacientes con diabetes tenemos en nuestra base",
+            "session_id": "api-sql-audit",
+        },
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["route"] == "sql"
+    sr = data.get("sql_result")
+    assert sr is not None, data
+    assert "executed_query" in sr
+    assert sr["executed_query"].strip().upper().startswith("SELECT"), sr["executed_query"]
+    assert "row_count" in sr
