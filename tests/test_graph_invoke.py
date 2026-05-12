@@ -54,6 +54,54 @@ def test_invoke_sql_route_with_clinical_db(tmp_path) -> None:
     assert not any("stub" in w for w in warns)
 
 
+def test_invoke_sql_route_nl_filtered_cohort(tmp_path) -> None:
+    """NL → SQL: diabetes + edad + metformina (solo un paciente cumple)."""
+    db = tmp_path / "cohort.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(
+        "CREATE TABLE patients (id TEXT, birthdate TEXT, deathdate TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO patients VALUES "
+        "('p-old', '1950-06-01', ''),"
+        "('p-young', '2010-01-01', '')"
+    )
+    conn.execute("CREATE TABLE conditions (patient TEXT, description TEXT)")
+    conn.execute(
+        "INSERT INTO conditions VALUES "
+        "('p-old', 'Type 2 diabetes mellitus'),"
+        "('p-young', 'Type 2 diabetes mellitus')"
+    )
+    conn.execute("CREATE TABLE medications (patient TEXT, description TEXT)")
+    conn.execute(
+        "INSERT INTO medications VALUES "
+        "('p-old', 'Metformin 500 MG Oral Tablet'),"
+        "('p-young', 'Metformin 500 MG Oral Tablet')"
+    )
+    conn.commit()
+    conn.close()
+    cap = SqliteClinicalCapability(db_path=str(db))
+    g = build_copilot_graph(evidence=StubEvidenceCapability(), clinical=cap)
+    result = g.invoke(
+        {
+            "user_query": (
+                "¿Cuántos pacientes diabéticos mayores de 65 toman metformina "
+                "en nuestra base de datos?"
+            ),
+            "session_id": "test-sql-nl-1",
+        }
+    )
+    assert result["route"] == Route.SQL
+    assert result["sql_result"]["row_count"] == 1
+    summaries = [
+        getattr(t, "summary", None) or (t.get("summary") if isinstance(t, dict) else "")
+        for t in result["trace"]
+    ]
+    assert any("NL→SQL" in s for s in summaries)
+    sql = result["sql_result"]["executed_query"] or ""
+    assert "conditions" in sql.lower() and "medications" in sql.lower()
+
+
 def test_invoke_sql_route(graph_stub) -> None:
     result = graph_stub.invoke(
         {

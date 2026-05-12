@@ -57,6 +57,11 @@ SQL_CASES: list[tuple[str, Route, str]] = [
         Route.SQL,
         "recuento con múltiples condiciones en cohorte",
     ),
+    (
+        "Paciente con diabetes, ¿cuántos tenemos en nuestra base?",
+        Route.SQL,
+        "perfil de paciente + conteo local sin señales de evidencia → SQL (regla 1)",
+    ),
 ]
 
 EVIDENCE_CASES: list[tuple[str, Route, str]] = [

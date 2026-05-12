@@ -22,11 +22,11 @@ Usuario
   ▼
 POST /query  →  LangGraph (router determinista)
   │
-  ├─ SQL ──────────────► nodo SQL (stub en v0.2)
+  ├─ SQL ──────────────► cohorte SQLite (NL heurístico → SQL seguro o conteo simple)
   │
   ├─ Evidence ─────────► build_pubmed_query (planner) → retrieve_evidence
   │
-  └─ Hybrid ───────────► resumen clínico (stub) → planner → evidencia → síntesis (stub) → safety
+  └─ Hybrid ───────────► resumen clínico (SQLite o stub) → planner → evidencia → síntesis (stub) → safety
 ```
 
 - **Planner** (`EvidenceQueryPlanner`): solo construye `pubmed_query` (heurística, LLM o composite con fallback).
@@ -39,7 +39,7 @@ POST /query  →  LangGraph (router determinista)
 
 | Capability | Implementación v0.2 | Notas |
 |------------|----------------------|--------|
-| **A — Clinical SQL** | `SqliteClinicalCapability` (`app/capabilities/clinical_sql/`) | SQLite vía `CLINICAL_DB_PATH`; el nodo clínico del grafo sigue en stub hasta cablearlo. Ver `docs/SYNTHEA.md`. |
+| **A — Clinical SQL** | `SqliteClinicalCapability`, ETL Synthea (`scripts/synthea_csv_to_sqlite.py`), `cohort_nl` (NL → `WHERE` / `EXISTS` acotados) | Ver `docs/SYNTHEA.md` y `CLINICAL_DB_PATH`. |
 | **B — Evidence** | `NcbiEvidenceCapability`, `EuropePmcCapability`, `MultiSourceEvidenceCapability`, `StubEvidenceCapability` | E-utilities alineadas con PRSN; query compartida con Europe PMC |
 
 ---
@@ -55,7 +55,7 @@ python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 | Ruta | Descripción |
 |------|-------------|
 | `POST /query` | Cuerpo: `{ "query": "...", "session_id": "opcional" }`. Respuesta: ruta, `pubmed_query`, `final_answer`, `trace`, `pmids`, `citations`, etc. |
-| `GET /health` | Estado + lectura no sensible de config (`copilot_query_planner`, `copilot_evidence_backend`, host LLM, si hay API key). |
+| `GET /health` | Estado + config no sensible (`copilot_query_planner`, `copilot_evidence_backend`, host LLM, API key, BD clínica resuelta). |
 | `GET /` | Enlaces a docs y health |
 | `GET /docs` | Swagger UI |
 
@@ -74,7 +74,7 @@ Copiar `.env.example` → `.env` y revisar al menos:
 | `LLM_BASE_URL`, `LLM_MODEL`, `OPENAI_API_KEY` | Necesarios si `COPILOT_QUERY_PLANNER=llm` o `llm_only` (p. ej. `https://api.openai.com/v1` + modelo OpenAI). |
 | `NCBI_EMAIL` | Recomendado para cuotas E-utilities |
 | `COPILOT_EVAL_LOG_PATH` | Opcional; log JSONL de evaluación |
-| `CLINICAL_DB_PATH` | Ruta al SQLite de datos clínicos (p. ej. `data/clinical/synthea.db` tras tu ETL). Usado por `SqliteClinicalCapability`. |
+| `CLINICAL_DB_PATH` | Ruta al SQLite de datos clínicos (p. ej. `data/clinical/synthea.db` tras tu ETL). Usado por `SqliteClinicalCapability`. **Rutas relativas** se resuelven desde la **raíz del repo** (no desde el directorio de trabajo de uvicorn). |
 
 Al arrancar, `app/main.py` carga `.env` y fuerza desde fichero las claves del planner/LLM para evitar que variables del sistema las pisen.
 
@@ -83,7 +83,7 @@ Al arrancar, `app/main.py` carga `.env` y fuerza desde fichero las claves del pl
 ## Datos Synthea y SQLite (capability A)
 
 1. Clonar y ejecutar Synthea (Java 17+). En Windows usa `.\gradlew.bat run -Params="['-p','100']"` en lugar de `./run_synthea`.
-2. Synthea **no** genera por defecto un `synthea.db`: normalmente FHIR/CCDA bajo `output/`; el CSV hay que activarlo en `synthea.properties`. Un `.db` SQLite es un paso **posterior** (import / ETL) al esquema que definas.
+2. Con CSV activados, importar a SQLite: `python scripts/synthea_csv_to_sqlite.py` (ver `docs/SYNTHEA.md`).
 3. Apunta `CLINICAL_DB_PATH` en `.env` a ese fichero.
 4. Detalle paso a paso: **[`docs/SYNTHEA.md`](docs/SYNTHEA.md)**.
 
@@ -120,16 +120,26 @@ Incluye grafo, API, PubMed (parser/integration opcional con `RUN_NCBI_INTEGRATIO
 
 ## Estado y roadmap
 
-### Hecho (≈ v0.2.x)
+### Hecho (≈ v0.3)
 
-- Grafo LangGraph con nodos stub + evidencia inyectable
-- `POST /query`, `GET /health`, carga de `.env` + caché de grafo por backend y planner
+- Grafo LangGraph: router determinista, evidencia inyectable, trazas (`trace`)
+- `POST /query`, `GET /health`, caché de grafo (evidencia + planner + BD clínica)
 - PubMed (NCBI), Europe PMC, multi-fuente, stub; planificador heurístico + LLM + composite
+- `SqliteClinicalCapability` + ETL CSV→SQLite + ruta SQL con **NL heurístico → SQL seguro** (`app/capabilities/clinical_sql/cohort_nl.py`)
 - Log de evaluación JSONL opcional
 
-### Siguiente
+### Próximos pasos (cohorte SQL y analizador)
 
-- Cablear `SqliteClinicalCapability` en el grafo (sustituir stub clínico / SQL) cuando `CLINICAL_DB_PATH` exista
-- Síntesis con LLM (sustituir stub)
-- Capability A SQL real sobre datos de demo
+Inspiración parcial en el proyecto hermano `sina_mcp/sqlite-analyzer` (p. ej. introspección de esquema y agente SQL en `FHire.py`), manteniendo aquí **SQL solo vía plantillas / builder** y `run_safe_query`, sin texto SQL arbitrario del modelo.
+
+| Ahora | Siguiente |
+|--------|-----------|
+| Heurística fija + sinónimos | **LLM o NER clínico** que rellene un `CohortNLSpec` (o JSON schema) con límites y validación |
+| Solo `COUNT(DISTINCT id)` | **`SELECT` con agregados / desglose**, siempre plantillas + validación |
+| Agente SQL abierto tipo `FHire.py` | Reutilizar ideas de **schema tool**, sin dejar al modelo escribir SQL arbitrario sin pasar por un **builder blanco** |
+
+### Más adelante
+
+- Síntesis con LLM (sustituir stub de síntesis)
 - UI / evaluación sistemática
+- Enriquecer cohorte (fechas Synthea, códigos, tablas adicionales del export)

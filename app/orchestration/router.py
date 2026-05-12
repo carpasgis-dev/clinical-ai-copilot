@@ -8,19 +8,20 @@ Contrato público:
     La razón se escribe directamente en el TraceStep del nodo Router.
 
 Precedencia de reglas (orden importa):
-    1. Señales híbridas explícitas        → HYBRID  (mayor prioridad)
-    2. Señales SQL *y* evidencia          → HYBRID  (ambas presentes)
-    3. Solo señales SQL                   → SQL
-    4. Solo señales de evidencia          → EVIDENCE
-    5. Sin señales claras                 → UNKNOWN
+    1. Solo señales SQL (sin evidencia)   → SQL  (cohortes / analytics primero)
+    2. Señales SQL *y* evidencia          → HYBRID
+    3. Evidencia + contexto de paciente   → HYBRID  (p. ej. «paciente con …» + evidencia)
+    4. Frases puente híbridas explícitas  → HYBRID
+    5. Solo señales de evidencia          → EVIDENCE
+    6. Sin señales claras                 → UNKNOWN
 
 Filosofía:
     - Función pura: misma entrada → misma salida siempre.
     - Sin imports de BD, PubMed ni LLM.
-    - Los falsos positivos en HYBRID son preferibles a los falsos negativos
-      (es mejor recuperar evidencia de más que no recuperarla).
-    - La tabla de señales es el único lugar para ajustar el comportamiento;
-      NO añadir lógica implícita fuera de _SIGNALS y _count_signals.
+    - Priorizar SQL cuando hay señales de datos locales sin pedir literatura
+      (evita sobre-disparar HYBRID en conteos/cohortes).
+    - Marcadores de «caso/paciente» solo empujan a HYBRID si también hay
+      señales de evidencia (regla 3); el resto de ajustes vive en señales.
 """
 from __future__ import annotations
 
@@ -45,6 +46,8 @@ class RouteSignals:
     - Añadir siempre ambas formas si el input del usuario puede variar.
     - Las señales más específicas (frases largas) tienen más peso semántico
       aunque el conteo las trate igual que las cortas.
+    - Los marcadores de contexto de paciente para HYBRID viven en
+      `_PATIENT_CONTEXT_MARKERS` y solo aplican junto a señales de evidencia.
     """
 
     sql: frozenset[str] = field(default_factory=lambda: frozenset({
@@ -62,6 +65,9 @@ class RouteSignals:
         "comorbilidad", "comorbilidades",
         # Acceso explícito a BD
         "en nuestra base", "en la base de datos", "en nuestra cohorte",
+        # Cohortes / inventario local (peso mayor que marcos de «paciente con»)
+        "tenemos", "cuántos tenemos", "cuantos tenemos",
+        "tenemos en nuestra base", "tenemos en nuestra cohorte",
         # Historia clínica (como registro, no como concepto médico)
         "historial clínico", "historial clinico",
         "historia clínica", "historia clinica",
@@ -90,22 +96,48 @@ class RouteSignals:
     }))
 
     hybrid_explicit: frozenset[str] = field(default_factory=lambda: frozenset({
-        # Frases que mezclan explícitamente perfil de paciente + evidencia
-        "paciente con",          # "Paciente con diabetes... ¿qué evidencia?"
-        "para este paciente",
-        "para mi paciente",
+        # Frases puente explícitas (literatura / guías en subpoblaciones).
+        # No incluir «paciente con» suelta: con evidencia se cubre vía
+        # _patient_context_with_evidence; sin evidencia no debe forzar HYBRID.
+        "qué evidencia existe para pacientes con",
+        "que evidencia existe para pacientes con",
+        "qué estudios hay en pacientes con",
+        "que estudios hay en pacientes con",
+        "qué estudios existen para pacientes con",
+        "que estudios existen para pacientes con",
+        "tratamiento recomendado para pacientes con",
+        "tratamientos recomendados para pacientes con",
+        "evidencia para pacientes con",
+        "evidencia en pacientes con",
         "pacientes similares",
         "perfil similar",
         "para pacientes como",
         "aplica a pacientes",
         "relevante para pacientes",
-        "en pacientes con",      # "evidencia en pacientes con hipertensión"
         "para este perfil",
         "para el perfil",
     }))
 
 
 _SIGNALS = RouteSignals()
+
+# Marcadores de caso clínico / subpoblación; solo activan HYBRID si además
+# hay señales de evidencia (ev_n >= 1). Así «paciente con … ¿cuántos?»
+# no fuerza literatura.
+_PATIENT_CONTEXT_MARKERS: frozenset[str] = frozenset({
+    "paciente con",
+    "para este paciente",
+    "para mi paciente",
+    "este paciente",
+    "mi paciente",
+    "en pacientes con",
+})
+
+
+def _patient_context_with_evidence(normalized: str) -> bool:
+    """True si el texto ancla un paciente/subpoblación explícita."""
+    return any(m in normalized for m in _PATIENT_CONTEXT_MARKERS)
+
 
 # ---------------------------------------------------------------------------
 # Disclaimers estáticos por ruta
@@ -167,13 +199,13 @@ def classify_route(query: str) -> tuple[Route, str]:
 
     Examples:
         >>> classify_route("¿Cuántos pacientes diabéticos mayores de 65 años existen?")
-        (<Route.SQL: 'sql'>, 'sql=2, evidence=0, hybrid_explicit=0 → sql only')
+        (<Route.SQL: 'sql'>, ...)
 
         >>> classify_route("¿Qué evidencia existe sobre metformina?")
-        (<Route.EVIDENCE: 'evidence'>, 'sql=0, evidence=1, hybrid_explicit=0 → evidence only')
+        (<Route.EVIDENCE: 'evidence'>, ...)
 
         >>> classify_route("Paciente con diabetes. ¿Qué evidencia existe?")
-        (<Route.HYBRID: 'hybrid'>, 'sql=0, evidence=1, hybrid_explicit=1 → explicit hybrid phrase')
+        (<Route.HYBRID: 'hybrid'>, ...)
     """
     norm = _normalize(query)
 
@@ -183,23 +215,27 @@ def classify_route(query: str) -> tuple[Route, str]:
 
     base_reason = f"sql={sql_n}, evidence={ev_n}, hybrid_explicit={hybrid_n}"
 
-    # Regla 1: frase híbrida explícita (mayor prioridad)
-    if hybrid_n >= 1:
-        return Route.HYBRID, f"{base_reason} → explicit hybrid phrase"
+    # Regla 1: datos locales / analytics sin pedir literatura
+    if sql_n >= 1 and ev_n == 0:
+        return Route.SQL, f"{base_reason} → sql only (no evidence signals)"
 
-    # Regla 2: señales de ambas categorías
+    # Regla 2: señales SQL y de evidencia en la misma consulta
     if sql_n >= 1 and ev_n >= 1:
-        return Route.HYBRID, f"{base_reason} → both sql+evidence signals"
+        return Route.HYBRID, f"{base_reason} → hybrid (sql + evidence signals)"
 
-    # Regla 3: solo SQL
-    if sql_n >= 1:
-        return Route.SQL, f"{base_reason} → sql only"
+    # Regla 3: evidencia con marco de paciente / subpoblación
+    if ev_n >= 1 and _patient_context_with_evidence(norm):
+        return Route.HYBRID, f"{base_reason} → hybrid (evidence + patient context)"
 
-    # Regla 4: solo evidencia
+    # Regla 4: frases puente híbrido muy explícitas
+    if hybrid_n >= 1:
+        return Route.HYBRID, f"{base_reason} → hybrid (explicit bridge phrase)"
+
+    # Regla 5: solo evidencia
     if ev_n >= 1:
         return Route.EVIDENCE, f"{base_reason} → evidence only"
 
-    # Regla 5: sin señales
+    # Regla 6: sin señales
     return Route.UNKNOWN, f"{base_reason} → no clear signals"
 
 

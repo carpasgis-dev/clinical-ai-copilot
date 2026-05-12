@@ -21,6 +21,8 @@ _FORBIDDEN = re.compile(
     re.I,
 )
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
 
 class SqliteClinicalCapability:
     """Introspección y SELECT acotado sobre un fichero SQLite."""
@@ -31,7 +33,11 @@ class SqliteClinicalCapability:
     def _connect(self) -> sqlite3.Connection:
         if not self._path:
             raise FileNotFoundError("CLINICAL_DB_PATH vacío")
-        path = Path(self._path).expanduser().resolve()
+        path = Path(self._path).expanduser()
+        if not path.is_absolute():
+            path = (_REPO_ROOT / path).resolve()
+        else:
+            path = path.resolve()
         if not path.is_file():
             raise FileNotFoundError(str(path))
         conn = sqlite3.connect(str(path), timeout=10.0)
@@ -48,6 +54,20 @@ class SqliteClinicalCapability:
                     "AND NOT (name GLOB 'sqlite*') ORDER BY name"
                 )
                 return [str(r[0]) for r in cur.fetchall()]
+        except Exception:
+            return []
+
+    def get_table_columns(self, table: str) -> list[str]:
+        """
+        Nombres de columnas vía ``PRAGMA`` (no pasa por ``run_safe_query``, donde ``PRAGMA`` está vetado).
+        """
+        name = (table or "").strip()
+        if not name or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+            return []
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(f"PRAGMA table_info({name})")
+                return [str(r[1]) for r in cur.fetchall()]
         except Exception:
             return []
 
