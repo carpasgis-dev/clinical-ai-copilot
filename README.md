@@ -1,16 +1,16 @@
 # Clinical Evidence Copilot
 
 > Copiloto de IA clínica que combina datos estructurados (SQL/FHIR/Synthea)
-> con evidencia biomédica fundamentada (PubMed + RAG + PMIDs verificables).
+> con evidencia biomédica fundamentada (PubMed / Europe PMC, PMIDs verificables).
 
 ## Visión
 
-Un copiloto healthcare-AI que decide de forma autónoma si una consulta requiere
-**datos del paciente/centro** (SQL), **evidencia bibliográfica** (PubMed) o **ambas**,
-y orquesta el pipeline adecuado de forma trazable y explicable.
+Un copiloto healthcare-AI que decide de forma **determinista** si una consulta requiere
+**datos del paciente/centro** (SQL), **evidencia bibliográfica** o **ambas**,
+y orquesta el pipeline con **trazabilidad** (`trace`).
 
-**Diferenciador:** combinación de razonamiento clínico estructurado
-con recuperación de evidencia biomédica verificable.
+**Diferenciador:** routing sin LLM en el router; evidencia recuperada con APIs reales
+y citas con PMID; planificación de query PubMed **heurística y/o LLM** (configurable).
 
 ---
 
@@ -20,52 +20,72 @@ con recuperación de evidencia biomédica verificable.
 Usuario
   │
   ▼
-[Router Node]          ← reglas deterministas, sin LLM
+POST /query  →  LangGraph (router determinista)
   │
-  ├─ SQL ──────────────► [SQL Node]
-  │                          │ SqlResult (query ejecutada, filas limitadas)
+  ├─ SQL ──────────────► nodo SQL (stub en v0.2)
   │
-  ├─ Evidence ─────────► [Evidence Node]
-  │                          │ EvidenceBundle (PMIDs, abstracts acotados)
+  ├─ Evidence ─────────► build_pubmed_query (planner) → retrieve_evidence
   │
-  └─ Hybrid ───────────► [ClinicalSummary] → [PubMedQueryBuilder]
-                              └──────────────► [EvidenceRetrieval]
-                                                    │
-                                              ▼
-                                        [Synthesis Node]
-                                              │
-                                        [Safety & Disclaimer]
-                                              │
-                                        Respuesta Final
-                              (JSON estructurado + markdown + trace)
+  └─ Hybrid ───────────► resumen clínico (stub) → planner → evidencia → síntesis (stub) → safety
 ```
 
-El **orquestador** (LangGraph) solo conoce `CopilotState` y los contratos de capability.
-Nunca importa SQL, schemas de BD ni APIs de PubMed directamente.
+- **Planner** (`EvidenceQueryPlanner`): solo construye `pubmed_query` (heurística, LLM o composite con fallback).
+- **Capability** (`EvidenceCapability`): ejecuta búsqueda (NCBI, Europe PMC, multi-fuente o stub en tests).
+- El grafo solo conoce `CopilotState` y los **Protocols** de `app/capabilities/contracts.py`.
 
 ---
 
 ## Capabilities
 
-| Capability | Origen | Responsabilidad |
-|------------|--------|-----------------|
-| **A — Clinical SQL** | sqlite-analyzer-mcp | SQL seguro, esquema, perfiles/cohortes |
-| **B — Evidence RAG** | PRSN 3.0 | PubMed, RAG, PMIDs, Open Access |
+| Capability | Implementación v0.2 | Notas |
+|------------|----------------------|--------|
+| **A — Clinical SQL** | `SqliteClinicalCapability` (`app/capabilities/clinical_sql/`) | SQLite vía `CLINICAL_DB_PATH`; el nodo clínico del grafo sigue en stub hasta cablearlo. Ver `docs/SYNTHEA.md`. |
+| **B — Evidence** | `NcbiEvidenceCapability`, `EuropePmcCapability`, `MultiSourceEvidenceCapability`, `StubEvidenceCapability` | E-utilities alineadas con PRSN; query compartida con Europe PMC |
 
 ---
 
-## Estado del proyecto
+## API (FastAPI)
 
-### v0.1.0 — PR #1: contratos de orquestación
+Desde la raíz del repo `clinical-ai-copilot`:
 
-- [x] `app/schemas/copilot_state.py` — estado del grafo + DTOs con límites de contexto
-- [x] `app/capabilities/contracts.py` — `ClinicalCapability` / `EvidenceCapability` (Protocols)
-- [x] `app/orchestration/router.py` — clasificador determinista con señales clínicas
-- [x] `tests/test_router.py` — golden paths + caso hero + tests de propiedades
-- [ ] Grafo LangGraph (nodos, flujo completo)
-- [ ] Capability A — implementación SQL
-- [ ] Capability B — implementación PubMed
-- [ ] FastAPI (`POST /query`) + UI
+```bash
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+| Ruta | Descripción |
+|------|-------------|
+| `POST /query` | Cuerpo: `{ "query": "...", "session_id": "opcional" }`. Respuesta: ruta, `pubmed_query`, `final_answer`, `trace`, `pmids`, `citations`, etc. |
+| `GET /health` | Estado + lectura no sensible de config (`copilot_query_planner`, `copilot_evidence_backend`, host LLM, si hay API key). |
+| `GET /` | Enlaces a docs y health |
+| `GET /docs` | Swagger UI |
+
+En Swagger, la pestaña **Example value** del código 200 muestra placeholders típicos del schema; los datos reales aparecen tras **Execute** en *Try it out*.
+
+---
+
+## Variables de entorno
+
+Copiar `.env.example` → `.env` y revisar al menos:
+
+| Variable | Rol |
+|----------|-----|
+| `COPILOT_EVIDENCE_BACKEND` | `ncbi` (default), `stub`, `epmc`, `multi` |
+| `COPILOT_QUERY_PLANNER` | `heuristic`, `llm` (LLM + fallback heurístico), `llm_only` |
+| `LLM_BASE_URL`, `LLM_MODEL`, `OPENAI_API_KEY` | Necesarios si `COPILOT_QUERY_PLANNER=llm` o `llm_only` (p. ej. `https://api.openai.com/v1` + modelo OpenAI). |
+| `NCBI_EMAIL` | Recomendado para cuotas E-utilities |
+| `COPILOT_EVAL_LOG_PATH` | Opcional; log JSONL de evaluación |
+| `CLINICAL_DB_PATH` | Ruta al SQLite de datos clínicos (p. ej. `data/clinical/synthea.db` tras tu ETL). Usado por `SqliteClinicalCapability`. |
+
+Al arrancar, `app/main.py` carga `.env` y fuerza desde fichero las claves del planner/LLM para evitar que variables del sistema las pisen.
+
+---
+
+## Datos Synthea y SQLite (capability A)
+
+1. Clonar y ejecutar Synthea (Java 17+). En Windows usa `.\gradlew.bat run -Params="['-p','100']"` en lugar de `./run_synthea`.
+2. Synthea **no** genera por defecto un `synthea.db`: normalmente FHIR/CCDA bajo `output/`; el CSV hay que activarlo en `synthea.properties`. Un `.db` SQLite es un paso **posterior** (import / ETL) al esquema que definas.
+3. Apunta `CLINICAL_DB_PATH` en `.env` a ese fichero.
+4. Detalle paso a paso: **[`docs/SYNTHEA.md`](docs/SYNTHEA.md)**.
 
 ---
 
@@ -77,53 +97,39 @@ python -m venv .venv
 # source .venv/bin/activate    # Linux / macOS
 
 pip install -r requirements.txt
-copy .env.example .env         # Rellenar credenciales
+copy .env.example .env         # Rellenar según tabla anterior
 ```
 
-## Ejecutar tests
+## Tests
 
 ```bash
-pytest tests/ -v
+pytest tests/ -q
 ```
 
-Salida esperada tras PR #1:
-
-```
-tests/test_router.py::test_hero_case PASSED
-tests/test_router.py::test_sql_route[...] PASSED  (×6)
-tests/test_router.py::test_evidence_route[...] PASSED  (×7)
-tests/test_router.py::test_hybrid_route[...] PASSED  (×6)
-tests/test_router.py::test_unknown_route[...] PASSED  (×5)
-tests/test_router.py::test_router_is_pure PASSED
-...
-```
+Incluye grafo, API, PubMed (parser/integration opcional con `RUN_NCBI_INTEGRATION`), planificadores de query, etc.
 
 ---
 
 ## Principios de diseño
 
-**NO hacer:**
-- Monolitos gigantes ni prompts con dumps completos de BD
-- Dependencia total del razonamiento LLM
-- Inventar PMIDs o citas no recuperadas
-- Cometer credenciales reales
+**Evitar:** monolitos con dumps de BD; inventar PMIDs; subir `.env` con secretos.
 
-**HACER:**
-- Routing determinista primero, LLM opcional después
-- Límites de contexto documentados y enforced en los DTOs
-- Citas verificables (PMID en cada artículo del bundle)
-- Trazabilidad completa (`trace: list[TraceStep]`) para healthcare governance
+**Priorizar:** routing determinista; límites en DTOs (`copilot_state`); **separación planner vs retrieval**; trazas auditables; fallback heurístico cuando el LLM falle.
 
 ---
 
-## Roadmap
+## Estado y roadmap
 
-| Milestone | Descripción |
-|-----------|-------------|
-| `v0.1` | Contratos, router, tests (este PR) |
-| `v0.2` | Grafo LangGraph con nodos stub |
-| `v0.3` | Capability B real (PubMed E-utilities) |
-| `v0.4` | Capability A real (SQL sobre Synthea) |
-| `v0.5` | FastAPI + UI básica con trace visible |
-| `v0.6` | Caso hero E2E funcional |
-| `v1.0` | Evaluación, guardrails, memoria de sesión |
+### Hecho (≈ v0.2.x)
+
+- Grafo LangGraph con nodos stub + evidencia inyectable
+- `POST /query`, `GET /health`, carga de `.env` + caché de grafo por backend y planner
+- PubMed (NCBI), Europe PMC, multi-fuente, stub; planificador heurístico + LLM + composite
+- Log de evaluación JSONL opcional
+
+### Siguiente
+
+- Cablear `SqliteClinicalCapability` en el grafo (sustituir stub clínico / SQL) cuando `CLINICAL_DB_PATH` exista
+- Síntesis con LLM (sustituir stub)
+- Capability A SQL real sobre datos de demo
+- UI / evaluación sistemática

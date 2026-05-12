@@ -26,3 +26,12 @@ htmlcov/
 # OS
 Thumbs.db
 .DS_Store
+
+# Logs de evaluación (estructura en git; contenido no)
+data/eval/*.jsonl
+
+# Synthea: salida voluminosa (FHIR/CSV); se genera en local
+data/synthea/output/
+
+# SQLite clínico (ETL local); no versionar binarios
+data/clinical/*.db
