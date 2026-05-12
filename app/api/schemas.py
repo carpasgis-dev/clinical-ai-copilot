@@ -1,9 +1,11 @@
 """Esquemas Pydantic para ``POST /query``."""
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
+
+_SQL_PREVIEW_MAX_ROWS = 5
 
 
 HERO_QUERY_EXAMPLE = (
@@ -38,6 +40,25 @@ class CitationOut(BaseModel):
     doi: Optional[str] = None
 
 
+class SqlResultOut(BaseModel):
+    """Fragmento del resultado SQL para auditoría (no vuelca tablas completas)."""
+
+    executed_query: str = Field(
+        "",
+        description="Sentencia SELECT (o WITH) ejecutada en la capability clínica.",
+    )
+    row_count: int = Field(0, description="Número de filas devuelto o conteo agregado según nodo SQL.")
+    tables_used: List[str] = Field(
+        default_factory=list,
+        description="Tablas referidas cuando el backend las informa.",
+    )
+    error: Optional[str] = Field(None, description="Error de ejecución SQL, si lo hubo.")
+    rows: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description=f"Hasta {_SQL_PREVIEW_MAX_ROWS} filas de muestra (p. ej. conteo agregado).",
+    )
+
+
 class TraceStepOut(BaseModel):
     """Un paso del grafo en la respuesta HTTP (tipado para OpenAPI / Swagger)."""
 
@@ -58,6 +79,10 @@ class QueryResponse(BaseModel):
     pubmed_query: Optional[str] = Field(
         None,
         description="Término enviado a PubMed / Europe PMC; null si no aplica.",
+    )
+    sql_result: Optional[SqlResultOut] = Field(
+        None,
+        description="SQL ejecutado en ruta `sql` (y muestra de filas); null en evidence/hybrid/unknown.",
     )
     final_answer: str = Field(
         ...,

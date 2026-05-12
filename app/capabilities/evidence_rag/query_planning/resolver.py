@@ -9,9 +9,15 @@ from app.capabilities.evidence_rag.query_planning.llm_planner import LlmQueryPla
 from app.capabilities.evidence_rag.query_planning.protocol import EvidenceQueryPlanner
 
 
-def query_planner_cache_token() -> str:
-    """Token estable para particionar caches (grafo) cuando cambia el planner."""
+def query_planner_mode() -> str:
+    """Modo del planificador (``heuristic`` | ``llm`` | …) sin mezclar con el token de caché."""
     return os.getenv("COPILOT_QUERY_PLANNER", "heuristic").lower().strip()
+
+
+def query_planner_cache_token() -> str:
+    """Token estable para particionar caches (grafo) cuando cambia el planner o el perfil LLM."""
+    profile = os.getenv("COPILOT_LLM_PROFILE", "custom").lower().strip()
+    return f"{query_planner_mode()}|{profile}"
 
 
 def resolve_query_planner() -> EvidenceQueryPlanner:
@@ -22,7 +28,7 @@ def resolve_query_planner() -> EvidenceQueryPlanner:
     - ``llm``: ``LlmQueryPlanner`` con fallback a heurística.
     - ``llm_only``: solo LLM (sin fallback; fallos propagan excepción).
     """
-    mode = query_planner_cache_token()
+    mode = query_planner_mode()
     h = HeuristicQueryPlanner()
     if mode in ("llm", "llm_composite", "composite"):
         return CompositeQueryPlanner(LlmQueryPlanner(), h)

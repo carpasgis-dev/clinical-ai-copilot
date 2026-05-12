@@ -28,7 +28,11 @@ class SqliteClinicalCapability:
     """Introspección y SELECT acotado sobre un fichero SQLite."""
 
     def __init__(self, db_path: Optional[str] = None) -> None:
-        self._path = (db_path or os.getenv("CLINICAL_DB_PATH", "") or "").strip()
+        # ``db_path=""`` es explícito (p. ej. tests): no caer en ``CLINICAL_DB_PATH`` del entorno.
+        if db_path is not None:
+            self._path = str(db_path).strip()
+        else:
+            self._path = (os.getenv("CLINICAL_DB_PATH", "") or "").strip()
 
     def _connect(self) -> sqlite3.Connection:
         if not self._path:

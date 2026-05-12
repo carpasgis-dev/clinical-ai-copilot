@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from app.api.schemas import CitationOut, QueryResponse, TraceStepOut
+from app.api.schemas import CitationOut, QueryResponse, SqlResultOut, TraceStepOut
 from app.schemas.copilot_state import Route, TraceStep
 
 
@@ -101,6 +101,38 @@ def citations_from_state(state: Dict[str, Any]) -> tuple[List[str], List[Citatio
     return pmids, cites
 
 
+_SQL_PREVIEW_ROWS = 5
+
+
+def _sql_result_out(state: Dict[str, Any]) -> Optional[SqlResultOut]:
+    """Extrae ``sql_result`` del estado para la API (muestra de filas acotada)."""
+    raw = state.get("sql_result")
+    if raw is None:
+        return None
+    if hasattr(raw, "model_dump"):
+        d = raw.model_dump(mode="json")
+    elif isinstance(raw, dict):
+        d = dict(raw)
+    else:
+        return None
+    rows_in = d.get("rows") or []
+    if not isinstance(rows_in, list):
+        rows_in = []
+    preview = rows_in[:_SQL_PREVIEW_ROWS]
+    rc = d.get("row_count")
+    try:
+        row_count = int(rc) if rc is not None else 0
+    except (TypeError, ValueError):
+        row_count = 0
+    return SqlResultOut(
+        executed_query=str(d.get("executed_query") or ""),
+        row_count=row_count,
+        tables_used=list(d.get("tables_used") or []),
+        error=None if d.get("error") is None else str(d.get("error")),
+        rows=preview,
+    )
+
+
 def build_query_response(
     state: Dict[str, Any],
     *,
@@ -114,6 +146,7 @@ def build_query_response(
         route=_route_value(state.get("route")),
         route_reason=str(state.get("route_reason") or ""),
         pubmed_query=state.get("pubmed_query"),
+        sql_result=_sql_result_out(state),
         final_answer=str(state.get("final_answer") or ""),
         disclaimer=str(state.get("disclaimer") or ""),
         trace=_trace_to_steps(state.get("trace")),
