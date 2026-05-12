@@ -4,7 +4,7 @@ Interfaces (Protocols) de las capabilities del copiloto.
 El orquestador y el grafo LangGraph SOLO interactúan con estos Protocols.
 Las implementaciones concretas viven en:
     capabilities/clinical_sql/   ← derivado de sqlite-analyzer-mcp
-    capabilities/evidence_rag/   ← derivado de PRSN 3.0
+    capabilities/evidence_rag/   ← NCBI, Europe PMC, multi-fuente (mismo ``EvidenceCapability``)
 
 Regla de arquitectura:
     Si un nodo LangGraph importa algo que NO sea de este módulo
