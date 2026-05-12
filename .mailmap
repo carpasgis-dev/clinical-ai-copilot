@@ -1,0 +1,12 @@
+# Unifica contributors en GitHub (respeta .mailmap en el gráfico).
+# Formato: Nombre canónico <email>  Nombre tal como en commit <email en commit>
+#
+# cursoragent (GitHub): https://github.com/cursoragent — id 199161495
+# Emails típicos en commits / co-authored-by:
+Carmen Pascual <carpasgis99@gmail.com> Cursor Agent <199161495+cursoragent@users.noreply.github.com>
+Carmen Pascual <carpasgis99@gmail.com> cursoragent <199161495+cursoragent@users.noreply.github.com>
+Carmen Pascual <carpasgis99@gmail.com> Cursor <199161495+cursoragent@users.noreply.github.com>
+Carmen Pascual <carpasgis99@gmail.com> Cursor Agent <cursoragent@users.noreply.github.com>
+
+# Tu identidad actual en el repo (opcional: unifica nombre para el gráfico)
+Carmen Pascual <carpasgis99@gmail.com> carmen <cpascual@laberit.com>
