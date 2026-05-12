@@ -9,6 +9,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, List
 
+from app.capabilities.clinical_sql.cohort_nl import (
+    build_synthea_cohort_count_sql,
+    extract_cohort_nl_heuristic,
+)
 from app.capabilities.contracts import ClinicalCapability, EvidenceCapability
 from app.orchestration.router import classify_route, get_disclaimer
 from app.schemas.copilot_state import (
@@ -63,28 +67,77 @@ def sql_stub_node(state: CopilotState) -> dict[str, Any]:
 
 
 def sql_route_node(state: CopilotState, clinical: ClinicalCapability | None) -> dict[str, Any]:
-    """Ruta SQL: stub si no hay BD; si no, conteo de cohorte viva vía ``SqliteClinicalCapability``."""
+    """Ruta SQL: stub si no hay BD; si no, conteo de cohorte (NL heurístico → SQL o conteo simple)."""
     if clinical is None:
         return sql_stub_node(state)
-    q_alive = (
-        "SELECT COUNT(*) AS cohort_size FROM patients "
-        "WHERE COALESCE(TRIM(deathdate), '') = ''"
-    )
-    r = clinical.run_safe_query(q_alive)
-    if r.error:
-        r = clinical.run_safe_query("SELECT COUNT(*) AS cohort_size FROM patients")
-    if r.error:
-        empty = SqlResult(executed_query=q_alive, error=r.error)
+
+    tables = {t.lower() for t in clinical.list_tables()}
+    if "patients" not in tables:
         return {
-            "sql_result": empty.model_dump(),
+            "sql_result": SqlResult(
+                executed_query="",
+                error="no hay tabla patients",
+            ).model_dump(),
             "trace": _new_trace_step(
                 NodeName.SQL,
-                "SqliteClinicalCapability cohort query falló",
-                error=r.error,
+                "SqliteClinicalCapability: sin tabla patients",
+                error="no hay tabla patients",
             ),
-            "warnings": [f"sql: {r.error}"],
+            "warnings": ["sql: base sin tabla patients"],
         }
+
+    gtc = getattr(clinical, "get_table_columns", None)
+    spec = extract_cohort_nl_heuristic(state["user_query"])
+    extra_warns: List[str] = []
+    r: SqlResult | None = None
+    trace_detail = "SqliteClinicalCapability cohort vivos (conteo simple)"
+    tables_used = ["patients"]
+
+    if callable(gtc) and spec.has_filters():
+        pcols = set(gtc("patients"))
+        ccols = set(gtc("conditions")) if "conditions" in tables else None
+        mcols = set(gtc("medications")) if "medications" in tables else None
+        built, wbuild = build_synthea_cohort_count_sql(
+            patient_cols=pcols,
+            condition_cols=ccols,
+            medication_cols=mcols,
+            spec=spec,
+        )
+        extra_warns.extend(wbuild)
+        if built:
+            r_try = clinical.run_safe_query(built)
+            if not r_try.error:
+                r = r_try
+                trace_detail = "SqliteClinicalCapability cohort NL→SQL (conteo filtrado)"
+                if "conditions" in built.lower():
+                    tables_used.append("conditions")
+                if "medications" in built.lower():
+                    tables_used.append("medications")
+            else:
+                extra_warns.append(f"sql: consulta filtrada inválida ({r_try.error}); conteo simple")
+
+    if r is None:
+        q_alive = (
+            "SELECT COUNT(*) AS cohort_size FROM patients "
+            "WHERE COALESCE(TRIM(deathdate), '') = ''"
+        )
+        r = clinical.run_safe_query(q_alive)
+        if r.error:
+            r = clinical.run_safe_query("SELECT COUNT(*) AS cohort_size FROM patients")
+        if r.error:
+            empty = SqlResult(executed_query=q_alive, error=r.error)
+            return {
+                "sql_result": empty.model_dump(),
+                "trace": _new_trace_step(
+                    NodeName.SQL,
+                    "SqliteClinicalCapability cohort query falló",
+                    error=r.error,
+                ),
+                "warnings": [f"sql: {r.error}", *extra_warns],
+            }
+
     rows = r.rows or []
+
     n = 0
     parsed = False
     if rows and "cohort_size" in rows[0]:
@@ -98,15 +151,12 @@ def sql_route_node(state: CopilotState, clinical: ClinicalCapability | None) -> 
         executed_query=r.executed_query,
         rows=rows,
         row_count=n if parsed else r.row_count,
-        tables_used=["patients"],
+        tables_used=tables_used,
     )
     return {
         "sql_result": sql_out.model_dump(),
-        "trace": _new_trace_step(
-            NodeName.SQL,
-            f"SqliteClinicalCapability cohort vivos n≈{sql_out.row_count}",
-        ),
-        "warnings": [],
+        "trace": _new_trace_step(NodeName.SQL, f"{trace_detail} n≈{sql_out.row_count}"),
+        "warnings": extra_warns,
     }
 
 
@@ -218,17 +268,44 @@ def unknown_stub_node(state: CopilotState) -> dict[str, Any]:
     }
 
 
+def _cohort_size_from_sql_result(sql_result: object) -> int | None:
+    """Extrae ``cohort_size`` del primer resultado de un conteo de cohorte."""
+    if not isinstance(sql_result, dict):
+        return None
+    rows = sql_result.get("rows") or []
+    if rows and isinstance(rows[0], dict):
+        raw = rows[0].get("cohort_size")
+        if raw is not None:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
 def synthesis_stub_node(state: CopilotState) -> dict[str, Any]:
     """Ensambla un borrador legible a partir de los campos presentes."""
     route = state["route"]
-    lines: List[str] = [
-        "[synthesis stub]",
-        f"session_id={state.get('session_id', '')}",
-        f"route={route.value}",
-        f"query={state['user_query']!r}",
-    ]
+    lines: List[str] = []
+    if route == Route.SQL and state.get("sql_result"):
+        n = _cohort_size_from_sql_result(state["sql_result"])
+        if n is not None:
+            lines.append(
+                f"Resultado (SQL): aproximadamente {n} pacientes en la cohorte consultada "
+                f"(datos locales; ver traza del nodo «sql» para la consulta ejecutada)."
+            )
+    lines.extend(
+        [
+            "[synthesis stub]",
+            f"session_id={state.get('session_id', '')}",
+            f"route={route.value}",
+            f"query={state['user_query']!r}",
+        ]
+    )
     if state.get("sql_result"):
-        lines.append("capability=sql_result present")
+        n = _cohort_size_from_sql_result(state["sql_result"])
+        if n is None:
+            lines.append("capability=sql_result present")
     if state.get("evidence_bundle"):
         lines.append("capability=evidence_bundle present")
     if state.get("clinical_context"):

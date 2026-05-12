@@ -26,6 +26,17 @@ def test_sqlite_list_tables_and_select(tmp_path) -> None:
     assert r.rows[0]["name"] == "A"
 
 
+def test_sqlite_get_table_columns(tmp_path) -> None:
+    db = tmp_path / "t.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE patients (id TEXT, birthdate TEXT)")
+    conn.commit()
+    conn.close()
+    cap = SqliteClinicalCapability(db_path=str(db))
+    cols = cap.get_table_columns("patients")
+    assert "id" in cols and "birthdate" in cols
+
+
 def test_sqlite_rejects_write(tmp_path) -> None:
     db = tmp_path / "x.db"
     c = sqlite3.connect(str(db))
