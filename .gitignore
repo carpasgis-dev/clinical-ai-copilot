@@ -3,6 +3,9 @@
 venv/
 .env
 
+# Identidad Git local (no subir: emails / mapeos de contributors)
+.mailmap
+
 # Python
 __pycache__/
 *.py[cod]
