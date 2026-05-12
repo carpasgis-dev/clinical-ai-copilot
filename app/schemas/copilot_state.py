@@ -5,7 +5,7 @@ CopilotState define exactamente qué información viaja entre nodos.
 Los DTOs (Pydantic) garantizan los límites de contexto.
 Los nodos SOLO escriben sus propios campos.
 
-Compatibilidad: Python 3.9+, Pydantic v1.
+Compatibilidad: Python 3.9+, Pydantic v2.
 
 Límites de contexto documentados (anti-prompt-gigante):
     _SQL_MAX_ROWS        = 50   filas máx en SqlResult
@@ -17,9 +17,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypedDict
+from operator import add
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Límites de contexto — cambiar aquí afecta a todo el sistema
@@ -45,11 +46,13 @@ class Route(str, Enum):
 class NodeName(str, Enum):
     """Nombres canónicos de los nodos del grafo LangGraph."""
     ROUTER = "router"
+    SQL = "sql"
     CLINICAL_SUMMARY = "clinical_summary"
     PUBMED_QUERY_BUILDER = "pubmed_query_builder"
     EVIDENCE_RETRIEVAL = "evidence_retrieval"
     SYNTHESIS = "synthesis"
     SAFETY = "safety"
+    FALLBACK = "fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -78,8 +81,9 @@ class ClinicalContext(BaseModel):
     population_hint: Optional[str] = None
     """Descripción breve del perfil para enriquecer la query de PubMed."""
 
-    @validator("conditions", "medications", pre=True, always=True)
-    def _cap_list(cls, v: list) -> list:
+    @field_validator("conditions", "medications", mode="before")
+    @classmethod
+    def _cap_list(cls, v: Any) -> List[str]:
         return (v or [])[:_CLINICAL_MAX_LIST]
 
 
@@ -94,8 +98,9 @@ class SqlResult(BaseModel):
     tables_used: List[str] = Field(default_factory=list)
     error: Optional[str] = None
 
-    @validator("rows", pre=True, always=True)
-    def _cap_rows(cls, v: list) -> list:
+    @field_validator("rows", mode="before")
+    @classmethod
+    def _cap_rows(cls, v: Any) -> List[Dict[str, Any]]:
         return (v or [])[:_SQL_MAX_ROWS]
 
 
@@ -109,9 +114,12 @@ class ArticleSummary(BaseModel):
     abstract_snippet: str = ""
     year: Optional[int] = None
     doi: Optional[str] = None
+    open_access: Optional[bool] = None
+    """True si la fuente (p. ej. Europe PMC) indica acceso abierto; NCBI puede dejarlo en None."""
 
-    @validator("abstract_snippet", pre=True, always=True)
-    def _cap_snippet(cls, v: str) -> str:
+    @field_validator("abstract_snippet", mode="before")
+    @classmethod
+    def _cap_snippet(cls, v: Any) -> str:
         return (v or "")[:_ARTICLE_MAX_SNIPPET]
 
 
@@ -127,8 +135,9 @@ class EvidenceBundle(BaseModel):
     chunks_used: int = 0
     oa_pdfs_retrieved: int = 0
 
-    @validator("articles", pre=True, always=True)
-    def _cap_articles(cls, v: list) -> list:
+    @field_validator("articles", mode="before")
+    @classmethod
+    def _cap_articles(cls, v: Any) -> List[Any]:
         return (v or [])[:_EVIDENCE_MAX_ART]
 
 
@@ -150,6 +159,17 @@ class TraceStep(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Reducers LangGraph (append-only; listas concatenadas con operator.add)
+# ---------------------------------------------------------------------------
+
+TraceAppend = Annotated[list[TraceStep], add]
+"""Pasos de auditoría: cada nodo devuelve solo los nuevos ítems a anexar."""
+
+WarningsAppend = Annotated[list[str], add]
+"""Avisos no fatales (timeouts, degradaciones, límites alcanzados)."""
+
+
+# ---------------------------------------------------------------------------
 # Estado principal del grafo (TypedDict — idiomático para LangGraph)
 # ---------------------------------------------------------------------------
 
@@ -160,7 +180,8 @@ class CopilotState(TypedDict, total=False):
     Convenciones:
     - total=False → cada nodo solo actualiza sus propios campos.
     - Los DTOs Pydantic garantizan límites; nunca pasar objetos crudos.
-    - 'trace' es append-only; en v2 se puede añadir un reducer LangGraph.
+    - ``trace`` y ``warnings`` usan reducer ``operator.add`` (append-only).
+      Cada nodo devuelve solo los elementos nuevos de la lista.
     - 'disclaimer' siempre se propaga aunque los demás campos estén vacíos.
 
     Campos obligatorios al iniciar el grafo:
@@ -180,6 +201,9 @@ class CopilotState(TypedDict, total=False):
     clinical_context: ClinicalContext
     """Producido por ClinicalSummaryNode. Solo resumen estructurado."""
 
+    pubmed_query: str
+    """Producido por PubMedQueryBuilderNode. Query lista para esearch."""
+
     sql_result: SqlResult
     """Producido por SQLNode. Incluye la query ejecutada para trazabilidad."""
 
@@ -197,8 +221,11 @@ class CopilotState(TypedDict, total=False):
     """Siempre presente. Generado por SafetyNode."""
 
     # Auditoría / governance
-    trace: List[TraceStep]
-    """Lista append-only de pasos de ejecución."""
+    trace: TraceAppend
+    """Pasos de ejecución (reducer append-only)."""
+
+    warnings: WarningsAppend
+    """Avisos acumulados (reducer append-only)."""
 
     # Metadata
     created_at: datetime
