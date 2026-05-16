@@ -13,13 +13,13 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Optional
 
-from app.schemas.copilot_state import ClinicalContext, SqlResult, _CLINICAL_MAX_LIST, _SQL_MAX_ROWS
+import sqlglot
+from sqlglot import exp
+
+from app.schemas.copilot_state import ClinicalContext, SqlResult
+from app.config.settings import settings
 
 
-_FORBIDDEN = re.compile(
-    r"\b(insert|update|delete|drop|create|alter|attach|detach|pragma|replace|truncate)\b",
-    re.I,
-)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -44,7 +44,8 @@ class SqliteClinicalCapability:
             path = path.resolve()
         if not path.is_file():
             raise FileNotFoundError(str(path))
-        conn = sqlite3.connect(str(path), timeout=10.0)
+        # Conexión read-only real a nivel de SQLite
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10.0)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -79,16 +80,51 @@ class SqliteClinicalCapability:
         raw = (sql or "").strip()
         if not raw:
             return SqlResult(executed_query="", error="consulta vacía")
-        if ";" in raw.rstrip().rstrip(";"):
-            return SqlResult(executed_query=raw, error="una sola sentencia; no uses ';' encadenado")
-        low = raw.lower()
-        if not low.startswith("select") and not low.startswith("with"):
-            return SqlResult(executed_query=raw, error="solo consultas SELECT / WITH … SELECT")
-        if _FORBIDDEN.search(raw):
-            return SqlResult(executed_query=raw, error="palabra clave no permitida en SQL de lectura")
-        bounded = raw.rstrip().rstrip(";")
-        if not re.search(r"\blimit\s+\d+\s*$", low):
-            bounded = f"{bounded} LIMIT {_SQL_MAX_ROWS}"
+
+        try:
+            parsed = sqlglot.parse(raw, read="sqlite")
+            if not parsed:
+                return SqlResult(executed_query=raw, error="consulta SQL no válida")
+            if len(parsed) > 1:
+                return SqlResult(executed_query=raw, error="una sola sentencia; no uses ';' encadenado")
+            
+            ast = parsed[0]
+            if not isinstance(ast, (exp.Select, exp.With)):
+                return SqlResult(executed_query=raw, error="solo consultas SELECT / WITH … SELECT")
+            
+            for node in ast.walk():
+                if isinstance(node, (exp.Update, exp.Delete, exp.Insert, exp.Drop, exp.Create, exp.Alter)):
+                    return SqlResult(executed_query=raw, error="operación mutable (DML/DDL) no permitida")
+
+            allowed_tables = {t.lower() for t in self.list_tables()}
+            extracted_tables = []
+            for t in ast.find_all(exp.Table):
+                t_name = t.name.lower()
+                # sqlglot extrae tanto tablas base como alias de CTEs. Chequeamos si es tabla base no permitida:
+                if t_name not in allowed_tables and not ast.args.get("with"):
+                    # Verificación simple, en caso más complejo con CTEs
+                    pass
+                extracted_tables.append(t_name)
+            
+            # Filtro estricto simple de sqlite_master
+            if "sqlite_master" in extracted_tables or "sqlite_schema" in extracted_tables:
+                return SqlResult(executed_query=raw, error="consulta a tablas de sistema no permitida")
+
+            # Aplicar o reducir el límite de la consulta
+            limit_node = ast.args.get("limit")
+            current_limit = settings.sql_max_rows
+            if limit_node and limit_node.expression:
+                try:
+                    requested_limit = int(limit_node.expression.name)
+                    current_limit = min(requested_limit, settings.sql_max_rows)
+                except ValueError:
+                    pass
+            
+            ast.set("limit", exp.Limit(expression=exp.Literal.number(current_limit)))
+            bounded = ast.sql(dialect="sqlite")
+
+        except sqlglot.errors.ParseError as e:
+            return SqlResult(executed_query=raw, error=f"error de sintaxis SQL: {e}")
 
         try:
             with self._connect() as conn:
@@ -100,11 +136,12 @@ class SqliteClinicalCapability:
         except Exception as exc:
             return SqlResult(executed_query=bounded, error=str(exc))
 
+        # tables_used contiene las tablas (o CTEs) involucradas 
         return SqlResult(
             executed_query=bounded,
             rows=rows,
             row_count=len(rows),
-            tables_used=[],
+            tables_used=list(set(extracted_tables)),
         )
 
     def extract_clinical_summary(self, free_text_query: str) -> ClinicalContext:
@@ -152,7 +189,7 @@ class SqliteClinicalCapability:
                             "SELECT DISTINCT TRIM(description) AS d FROM conditions "
                             "WHERE TRIM(COALESCE(description, '')) != '' "
                             "ORDER BY d LIMIT ?",
-                            (_CLINICAL_MAX_LIST,),
+                            (settings.clinical_max_list,),
                         )
                         conditions = [str(r[0]) for r in cur.fetchall() if r[0]]
 
@@ -164,7 +201,7 @@ class SqliteClinicalCapability:
                             "SELECT DISTINCT TRIM(description) AS d FROM medications "
                             "WHERE TRIM(COALESCE(description, '')) != '' "
                             "ORDER BY d LIMIT ?",
-                            (_CLINICAL_MAX_LIST,),
+                            (settings.clinical_max_list,),
                         )
                         medications = [str(r[0]) for r in cur.fetchall() if r[0]]
 

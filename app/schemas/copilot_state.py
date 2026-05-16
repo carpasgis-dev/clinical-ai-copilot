@@ -8,10 +8,11 @@ Los nodos SOLO escriben sus propios campos.
 Compatibilidad: Python 3.9+, Pydantic v2.
 
 Límites de contexto documentados (anti-prompt-gigante):
-    _SQL_MAX_ROWS        = 50   filas máx en SqlResult
-    _EVIDENCE_MAX_ART    = 6    artículos máx en EvidenceBundle
-    _ARTICLE_MAX_SNIPPET = 500  chars de abstract por artículo
-    _CLINICAL_MAX_LIST   = 10   ítems por lista en ClinicalContext
+    settings.sql_max_rows        = 50   filas máx en SqlResult
+    settings.evidence_max_art    = 6    artículos máx en EvidenceBundle (salida final)
+    _EVIDENCE_RETRIEVAL_POOL_MAX = 200  candidatos pre-rerank (pool PubMed antes de embed)
+    settings.article_max_snippet = 500  chars de abstract por artículo
+    settings.clinical_max_list   = 10   ítems por lista en ClinicalContext
 """
 from __future__ import annotations
 
@@ -22,14 +23,7 @@ from typing import Annotated, Any, Dict, List, Optional, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
-# ---------------------------------------------------------------------------
-# Límites de contexto — cambiar aquí afecta a todo el sistema
-# ---------------------------------------------------------------------------
-_SQL_MAX_ROWS: int = 50
-_EVIDENCE_MAX_ART: int = 6
-_ARTICLE_MAX_SNIPPET: int = 500
-_CLINICAL_MAX_LIST: int = 10
-
+from app.config.settings import settings
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -41,11 +35,13 @@ class Route(str, Enum):
     EVIDENCE = "evidence"
     HYBRID = "hybrid"
     UNKNOWN = "unknown"
+    AMBIGUOUS = "ambiguous"
 
 
 class NodeName(str, Enum):
     """Nombres canónicos de los nodos del grafo LangGraph."""
     ROUTER = "router"
+    PLANNER = "planner"
     SQL = "sql"
     CLINICAL_SUMMARY = "clinical_summary"
     PUBMED_QUERY_BUILDER = "pubmed_query_builder"
@@ -53,6 +49,8 @@ class NodeName(str, Enum):
     SYNTHESIS = "synthesis"
     SAFETY = "safety"
     FALLBACK = "fallback"
+    CLARIFY = "clarify"
+    REASONING = "reasoning"
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +63,9 @@ class ClinicalContext(BaseModel):
 
     Regla: NUNCA contiene filas crudas ni dumps de BD.
     Solo viajan agregados mínimos necesarios para construir la query PubMed.
+
+    Los campos ``population_*`` reflejan la cohorte acotada (p. ej. híbrido con SQL);
+    ``conditions`` / ``medications`` siguen siendo hints generales desde BD o stub.
     """
     age_range: Optional[str] = None
     """Rango de edad descriptivo: '65-80', '>65', etc."""
@@ -76,21 +77,41 @@ class ClinicalContext(BaseModel):
     """Medicamentos relevantes: ['metformina', 'enalapril']."""
 
     population_size: Optional[int] = None
-    """Solo para consultas poblacionales: número de pacientes encontrados."""
+    """Número de pacientes en la cohorte consultada (conteo SQL) cuando aplica."""
 
     population_hint: Optional[str] = None
     """Descripción breve del perfil para enriquecer la query de PubMed."""
 
+    population_conditions: List[str] = Field(default_factory=list)
+    """Condiciones de cohorte para UI/prompts: se condensan prefijos redundantes (p. ej. ``diabet``+``diabetes`` → solo el término más largo); el SQL usa la lista completa del ``CohortQuery``."""
+
+    population_medications: List[str] = Field(default_factory=list)
+    """Medicación de cohorte para UI/prompts (misma condensación por prefijo que ``population_conditions`` cuando aplica)."""
+
+    population_age_min: Optional[int] = None
+    """Edad mínima inclusiva (años) de la cohorte."""
+
+    population_age_max: Optional[int] = None
+    """Edad máxima exclusiva (años) de la cohorte, si se filtró."""
+
+    population_sex: Optional[str] = None
+    """``F`` / ``M`` si la cohorte filtró por sexo."""
+
     @field_validator("conditions", "medications", mode="before")
     @classmethod
     def _cap_list(cls, v: Any) -> List[str]:
-        return (v or [])[:_CLINICAL_MAX_LIST]
+        return (v or [])[:settings.clinical_max_list]
+
+    @field_validator("population_conditions", "population_medications", mode="before")
+    @classmethod
+    def _cap_population_lists(cls, v: Any) -> List[str]:
+        return (v or [])[:settings.clinical_max_list]
 
 
 class SqlResult(BaseModel):
     """
     Resultado de ejecución SQL.
-    Las filas están limitadas a _SQL_MAX_ROWS para evitar prompts gigantes.
+    Las filas están limitadas a settings.sql_max_rows para evitar prompts gigantes.
     """
     executed_query: str
     rows: List[Dict[str, Any]] = Field(default_factory=list)
@@ -101,13 +122,13 @@ class SqlResult(BaseModel):
     @field_validator("rows", mode="before")
     @classmethod
     def _cap_rows(cls, v: Any) -> List[Dict[str, Any]]:
-        return (v or [])[:_SQL_MAX_ROWS]
+        return (v or [])[:settings.sql_max_rows]
 
 
 class ArticleSummary(BaseModel):
     """
     Resumen de un artículo PubMed.
-    El snippet de abstract está acotado a _ARTICLE_MAX_SNIPPET chars.
+    El snippet de abstract está acotado a settings.article_max_snippet chars.
     """
     pmid: str
     title: str
@@ -120,13 +141,13 @@ class ArticleSummary(BaseModel):
     @field_validator("abstract_snippet", mode="before")
     @classmethod
     def _cap_snippet(cls, v: Any) -> str:
-        return (v or "")[:_ARTICLE_MAX_SNIPPET]
+        return (v or "")[:settings.article_max_snippet]
 
 
 class EvidenceBundle(BaseModel):
     """
     Bundle de evidencia PubMed.
-    Máximo _EVIDENCE_MAX_ART artículos en contexto (v1).
+    Máximo settings.evidence_max_art artículos en contexto (v1).
     Siempre incluye PMIDs para trazabilidad/citas.
     """
     search_term: str
@@ -134,11 +155,15 @@ class EvidenceBundle(BaseModel):
     articles: List[ArticleSummary] = Field(default_factory=list)
     chunks_used: int = 0
     oa_pdfs_retrieved: int = 0
+    retrieval_debug: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Observabilidad del retrieval (NCBI: outcome, attempts, errors).",
+    )
 
     @field_validator("articles", mode="before")
     @classmethod
     def _cap_articles(cls, v: Any) -> List[Any]:
-        return (v or [])[:_EVIDENCE_MAX_ART]
+        return (v or [])[:settings.evidence_max_art]
 
 
 class TraceStep(BaseModel):
@@ -192,16 +217,29 @@ class CopilotState(TypedDict, total=False):
     user_query: str
     session_id: str
 
+    resolved_user_query: str
+    """Texto efectivo NL (p. ej. consulta original + aclaración tras ``Route.AMBIGUOUS``)."""
+
+    needs_clarification: bool
+    """True si el turno termina pidiendo aclaración al usuario (fase 3.3)."""
+
+    clarification_question: str
+    """Pregunta mostrada al usuario cuando ``needs_clarification`` es True."""
+
     # Routing
     route: Route
     route_reason: str
     """Qué regla/señal determinó la ruta — para el TraceStep del Router."""
+
+    execution_plan: list[dict[str, str | None]]
+    """Pasos previstos por el planner explícito (``kind`` + ``reason``); JSON-serializable."""
 
     # Outputs de capabilities
     clinical_context: ClinicalContext
     """Producido por ClinicalSummaryNode. Solo resumen estructurado."""
 
     pubmed_query: str
+    pubmed_queries_executed: list[str]
     """Producido por PubMedQueryBuilderNode. Query lista para esearch."""
 
     sql_result: SqlResult
@@ -210,9 +248,18 @@ class CopilotState(TypedDict, total=False):
     evidence_bundle: EvidenceBundle
     """Producido por EvidenceRetrievalNode. Incluye PMIDs para citas."""
 
+    clinical_intent: dict[str, Any]
+    """Intención clínica PICO-lite (``ClinicalIntent``) extraída para re-ranking y síntesis."""
+
+    reasoning_state: dict[str, Any]
+    """Razonamiento clínico explícito (fase 3.7); JSON-serializable (``ReasoningState``)."""
+
     # Pipeline de síntesis
     synthesis_draft: str
     """Draft interno antes del nodo Safety."""
+
+    medical_answer: dict[str, Any]
+    """Respuesta médica estructurada (fase 3.4), JSON-serializable para LangGraph."""
 
     final_answer: str
     """Respuesta final formateada para el usuario."""
