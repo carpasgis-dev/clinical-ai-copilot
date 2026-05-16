@@ -1,0 +1,9 @@
+# Rerank semántico opcional (embeddings + cross-encoder).
+# Instalar además de requirements.txt:
+#   pip install -r requirements-semantic.txt
+#
+# Modelos por defecto (vía env): BAAI/bge-small-en-v1.5 + BAAI/bge-reranker-base
+# Alternativas biomédicas: PubMedBERT, BioLinkBERT, MedCPT (configurar COPILOT_*_MODEL).
+
+sentence-transformers>=3.0.0,<4.0
+torch>=2.0.0
