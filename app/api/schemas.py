@@ -269,6 +269,18 @@ class MedicalAnswer(BaseModel):
         None,
         description="Bloque narrativo de evidencia PubMed externa.",
     )
+    aggregated_findings: Optional[str] = Field(
+        None,
+        description="Hallazgos agregados por clase terapéutica (determinista, cross-paper).",
+    )
+    clinical_claim_bundle: Optional[Dict[str, Any]] = Field(
+        None,
+        description="ClaimBundle serializado (afirmaciones clínicas agregadas, determinista).",
+    )
+    clinical_claims_summary: Optional[str] = Field(
+        None,
+        description="Resumen markdown de claims para síntesis claim-first.",
+    )
     cohort_size: Optional[int] = Field(
         None,
         description="Tamaño de cohorte local si el conteo SQL está disponible.",
@@ -330,6 +342,12 @@ class SynthesisCalibrationOut(BaseModel):
         ge=0.0,
         le=1.0,
         description="Confianza heurística en la calidad del pool recuperado.",
+    )
+    clinical_answer_confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Utilidad del top-N para responder la pregunta (answerability), no solo recall.",
     )
     evidence_specificity: float = Field(
         0.0,

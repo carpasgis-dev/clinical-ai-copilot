@@ -11,6 +11,29 @@ def test_synthesis_uses_llm_false_by_default(monkeypatch: pytest.MonkeyPatch) ->
     assert synthesis_uses_llm() is False
 
 
+def test_synthesis_system_prompt_compact_for_llamacpp(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.orchestration.llm_synthesis import (
+        _SYSTEM_SYNTHESIS,
+        _SYSTEM_SYNTHESIS_COMPACT,
+        synthesis_system_prompt,
+    )
+
+    monkeypatch.setenv("COPILOT_LLM_PROFILE", "llamacpp")
+    monkeypatch.delenv("COPILOT_SYNTHESIS_COMPACT_PROMPT", raising=False)
+    assert synthesis_system_prompt() == _SYSTEM_SYNTHESIS_COMPACT
+    assert len(_SYSTEM_SYNTHESIS_COMPACT) < len(_SYSTEM_SYNTHESIS) // 2
+
+    monkeypatch.setenv("COPILOT_LLM_PROFILE", "openai")
+    assert synthesis_system_prompt() == _SYSTEM_SYNTHESIS
+
+
+def test_is_context_size_exceeded() -> None:
+    from app.orchestration.llm_synthesis import _is_context_size_exceeded
+
+    assert _is_context_size_exceeded(RuntimeError("Context size has been exceeded."))
+    assert not _is_context_size_exceeded(RuntimeError("connection refused"))
+
+
 def test_synthesis_uses_llm_requires_mode_and_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COPILOT_SYNTHESIS", "llm")
     monkeypatch.setenv("LLM_BASE_URL", "http://127.0.0.1:8080/v1")
@@ -154,6 +177,80 @@ def test_compact_facts_flags_comparison_for_hybrid_question() -> None:
     data = __import__("json").loads(raw)
     assert data["pregunta_pide_comparacion_terapeutica_directa"] is True
     assert data["citas_pubmed"][0]["pmid"] == "1"
+
+
+def test_synthesis_windowed_assembles_sections(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.orchestration import llm_synthesis as ls
+
+    calls: list[str] = []
+
+    def _fake_chat(**kw: object) -> str:
+        user = str(kw.get("user") or "")
+        calls.append(user[:40])
+        if "mensaje_cohorte_sql" in user or "tamano_cohorte" in user:
+            return "## Datos locales (SQL)\n\nCohorte n=2."
+        if "citas_pubmed" in user and "estudios_ya_redactados" not in user:
+            return "### PMID 111 — Trial A\nResumen A."
+        return "Síntesis sobre la pregunta clínica\n\nCierre integrador."
+    monkeypatch.setattr(ls, "_llm_synthesis_chat", _fake_chat)
+
+    facts = {
+        "pregunta_usuario": "riesgo CV",
+        "ruta_pipeline": "hybrid",
+        "mensaje_cohorte_sql": "n=2",
+        "tamano_cohorte": 2,
+        "pregunta_pide_comparacion_terapeutica_directa": False,
+        "citas_pubmed": [{"pmid": "111", "title": "Trial A", "extracto_del_resumen_indexado": "x"}],
+        "calibracion_sintesis": None,
+    }
+    text, warns = ls._synthesis_narrative_windowed(
+        facts,
+        base_url="http://x",
+        api_key=None,
+        model="m",
+        max_tokens=512,
+        temperature=0.0,
+        timeout_s=30.0,
+    )
+    assert text
+    assert "## Datos locales (SQL)" in text
+    assert "### PMID 111" in text
+    assert "Síntesis sobre la pregunta clínica" in text
+    assert len(calls) == 3
+    assert any("ventanas" in w for w in warns)
+
+
+def test_try_llm_synthesis_uses_windows_on_context_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COPILOT_SYNTHESIS", "llm")
+    monkeypatch.setenv("LLM_BASE_URL", "http://127.0.0.1:8080/v1")
+    monkeypatch.setenv("LLM_MODEL", "m")
+    monkeypatch.setenv("COPILOT_SYNTHESIS_WINDOWED", "auto")
+
+    from app.orchestration import llm_synthesis as ls
+
+    def _fail_mono(**kw: object) -> str:
+        if "HECHOS_JSON" in str(kw.get("user") or ""):
+            raise RuntimeError("Context size has been exceeded.")
+        raise AssertionError("llamada inesperada en test monolítico")
+
+    monkeypatch.setattr(ls, "_llm_synthesis_chat", _fail_mono)
+    monkeypatch.setattr(
+        ls,
+        "_synthesis_narrative_windowed",
+        lambda facts, **kw: (
+            "## Datos locales (SQL)\n\nOk.\n\n"
+            "## Evidencia bibliográfica (PubMed)\n\n### PMID 1 — T\nBody.\n\n"
+            "Síntesis sobre la pregunta clínica\n\nFin.",
+            ["synthesis_llm: modo ventanas"],
+        ),
+    )
+
+    text, warns = ls.try_llm_synthesis_narrative(
+        {"user_query": "metformina", "route": "evidence"},
+        {"summary": "s", "citations": [{"pmid": "1", "title": "T"}]},
+    )
+    assert text and "PMID 1" in text
+    assert any("ventanas" in w for w in warns)
 
 
 def test_medical_answer_after_llm_updates_limitations() -> None:

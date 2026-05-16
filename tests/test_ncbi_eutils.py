@@ -44,8 +44,8 @@ def test_ncbi_evidence_capability_build_query() -> None:
         "metformina riesgo cardiovascular",
         ClinicalContext(conditions=["diabetes tipo 2"], medications=["metformina"]),
     )
-    assert "metformina" in q.lower()
-    assert "diabetes" in q.lower()
+    assert "metformin" in q.lower()
+    assert "cardiovascular" in q.lower() or "mace" in q.lower()
 
 
 def test_ncbi_evidence_capability_retrieve_evidence_empty_query() -> None:

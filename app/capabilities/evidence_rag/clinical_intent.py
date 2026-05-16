@@ -44,6 +44,8 @@ class ClinicalIntent:
     population_noise: list[str] = field(default_factory=list)
     # Eje dominante de la pregunta (afecta recuperación PubMed vs rerank).
     priority_axis: IntentPriorityAxis = "intervention"
+    # Objetivo clínico (comparative_effectiveness, treatment_efficacy, …).
+    question_type: str = "general"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -56,6 +58,7 @@ class ClinicalIntent:
             "age_max": self.age_max,
             "population_noise": list(self.population_noise),
             "priority_axis": self.priority_axis,
+            "question_type": self.question_type,
         }
 
     @classmethod
@@ -76,6 +79,7 @@ class ClinicalIntent:
                 str(x) for x in (raw.get("population_noise") or []) if str(x).strip()
             ],
             priority_axis=_coerce_priority_axis(raw.get("priority_axis")),
+            question_type=str(raw.get("question_type") or "general"),
         )
 
 
@@ -154,6 +158,17 @@ def _population_from_text(fl: str) -> list[str]:
         pop.append("type 2 diabetes")
     if _has_any(fl, (r"\bhipertens", r"\bhta\b", r"\bblood\s+pressure", r"\bantihypertens")):
         pop.append("hypertension")
+    if _has_any(
+        fl,
+        (
+            r"\bfibrilacion\s+auricular\b",
+            r"\bfibrilación\s+auricular\b",
+            r"\batrial\s+fibrill",
+            r"\bnvaf\b",
+            r"\bfa\b",
+        ),
+    ):
+        pop.append("atrial fibrillation")
     if _has_any(fl, (r"\bpcos\b", r"\bpolycystic\s+ovary", r"\bsop\b")):
         pop.append("pcos")
     if _has_any(fl, (r"\bobes", r"\boverweight", r"\bbmi\b")):
@@ -203,10 +218,13 @@ def _interventions_from_text(fl: str) -> list[str]:
         fl,
         (
             r"\bdoac\b",
+            r"\bnoac\b",
             r"\banticoagul",
             r"\bwarfarin",
             r"\bapixaban",
             r"\brivaroxaban",
+            r"\bdabigatran",
+            r"\bedoxaban",
         ),
     ):
         iv.append("anticoagulation")
@@ -215,6 +233,23 @@ def _interventions_from_text(fl: str) -> list[str]:
 
 def _comparator_from_text(fl: str) -> list[str]:
     comp: list[str] = []
+    has_doac = _has_any(
+        fl,
+        (
+            r"\bdoac\b",
+            r"\bnoac\b",
+            r"\bapixaban",
+            r"\brivaroxaban",
+            r"\bdabigatran",
+            r"\bedoxaban",
+            r"\banticoagul",
+        ),
+    )
+    has_warf = _has_any(fl, (r"\bwarfarin", r"\bwarfarina", r"\bavk\b"))
+    if has_doac and has_warf:
+        comp.append("warfarin")
+        comp.append("vitamin K antagonist")
+
     if _has_any(
         fl,
         (
@@ -223,14 +258,17 @@ def _comparator_from_text(fl: str) -> list[str]:
             r"\bversus\b",
             r"\bcompar",
             r"\brespecto\s+a\b",
+            r"\s+o\s+",
         ),
-    ):
+    ) or (has_doac and has_warf):
         if _has_any(fl, (r"\bmetformin", r"\bmetformina")):
             comp.append("metformin")
         if _has_any(fl, (r"\bplacebo", r"\bcontrol\b")):
             comp.append("placebo")
-        if _has_any(fl, (r"\bwarfarin", r"\bdoac")):
+        if _has_any(fl, (r"\bwarfarin", r"\bdoac", r"\bnoac", r"\bavk\b")):
             comp.append("warfarin")
+        if _has_any(fl, (r"\bplacebo", r"\bcontrol\b")) and not comp:
+            comp.append("placebo")
     return _dedupe(comp)
 
 
@@ -437,6 +475,9 @@ def extract_clinical_intent(
     )
     merged = merge_intent_with_cohort(intent, clinical_context)
     merged.priority_axis = infer_priority_axis(q, merged)
+    from app.capabilities.evidence_rag.clinical_intent_graph import classify_question_type
+
+    merged.question_type = classify_question_type(q, merged)
     return merged
 
 
@@ -488,6 +529,8 @@ def merge_intent_with_cohort(
         evidence_preference=intent.evidence_preference,
         age_min=age_min,
         age_max=age_max,
+        priority_axis=intent.priority_axis,
+        question_type=intent.question_type,
     )
     merged.population_noise = _noise_targets_for_intent(merged)
     return merged

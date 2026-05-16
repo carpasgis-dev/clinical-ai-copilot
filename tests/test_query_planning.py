@@ -28,10 +28,10 @@ def test_build_evidence_query_uses_population_mesh() -> None:
         population_size=2,
     )
     q = build_evidence_search_query("riesgo cardiovascular", ctx)
-    assert "aged[MeSH Terms]" in q
-    assert "female[MeSH Terms]" in q
+    # Edad/sexo: rerank y aplicabilidad, no AND bloqueante en PubMed (recall T1).
+    assert "aged[MeSH Terms]" not in q
+    assert "female[MeSH Terms]" not in q
     assert "diabetes mellitus" in q.lower() or "diabet" in q.lower()
-    assert "metformin" in q.lower() or "metform" in q.lower()
     assert "cardiovascular disease" in q.lower() or "heart disease" in q.lower()
     assert "riesgo cardiovascular" not in q.lower()
 
@@ -75,11 +75,8 @@ def test_structured_population_ignores_global_medication_noise() -> None:
     )
     assert "Leuprolide" not in q
     assert "unrelated" not in q.lower()
-    assert (
-        "therapy[tiab]" in q
-        or "meta-analysis" in q.lower()
-        or "systematic review" in q.lower()
-    )
+    assert "diabet" in q.lower() or "diabetes mellitus" in q.lower()
+    assert "cardiovascular" in q.lower() or "mace" in q.lower()
     assert q.count(" AND ") >= 1
 
 

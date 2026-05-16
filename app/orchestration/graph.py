@@ -17,6 +17,7 @@ from app.orchestration.nodes import (
     router_node,
     safety_node,
     synthesis_stub_node,
+    synthesis_calibration_node,
 )
 from app.schemas.copilot_state import CopilotState, Route
 
@@ -65,6 +66,7 @@ def build_copilot_graph(
         "executor",
         partial(executor_node, clinical=clinical, evidence=ev),
     )
+    builder.add_node("synthesis_calibration", synthesis_calibration_node)
     builder.add_node("reasoning", reasoning_node)
     builder.add_node("synthesis", synthesis_stub_node)
     builder.add_node("safety", safety_node)
@@ -72,7 +74,8 @@ def build_copilot_graph(
     builder.add_edge(START, "router")
     builder.add_edge("router", "planner")
     builder.add_edge("planner", "executor")
-    builder.add_edge("executor", "reasoning")
+    builder.add_edge("executor", "synthesis_calibration")
+    builder.add_edge("synthesis_calibration", "reasoning")
     builder.add_conditional_edges(
         "reasoning",
         _after_reasoning,

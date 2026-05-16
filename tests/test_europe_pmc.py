@@ -31,7 +31,14 @@ def test_europe_pmc_retrieve_evidence_maps_json() -> None:
     mock_resp.json = MagicMock(return_value=payload)
 
     cap = EuropePmcCapability()
-    with patch("httpx.Client.get", return_value=mock_resp):
+    hits = payload["resultList"]["result"]
+    with patch(
+        "app.capabilities.evidence_rag.retrieval_parallel.parallel_retrieval_enabled",
+        return_value=False,
+    ), patch(
+        "app.capabilities.evidence_rag.europe_pmc.search_europe_pmc",
+        return_value=hits,
+    ):
         bundle = cap.retrieve_evidence("metformin diabetes", retmax=3, years_back=0)
 
     assert bundle.search_term == "metformin diabetes"

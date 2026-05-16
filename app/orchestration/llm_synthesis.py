@@ -64,9 +64,13 @@ A) Si «pregunta_pide_comparacion_terapeutica_directa» es **true**:
    explícitamente sin inferir superioridad de una opción.
 
 B) Si «pregunta_pide_comparacion_terapeutica_directa» es **false**:
-   Párrafo titulado exactamente **Síntesis sobre la pregunta clínica**. Resume estrictamente la temática de los PMIDs aportados. Si predominan estudios 'mechanistic' o preclínicos, aclara fuertemente que la evidencia aportada explica mecanismos o vías y NO demuestra eficacia clínica directa para la pregunta. No extrapoles conclusiones. Señala si faltan en el lote estudios de eficacia/RCT centrados en la intervención preguntada. No uses el
-   título «Síntesis sobre la comparación solicitada» ni hables de «comparación directa»
-   salvo que la pregunta lo pida.
+   Párrafo titulado exactamente **Síntesis sobre la pregunta clínica**. Si existe
+   «claims_clinicos_resumen», úsalo como eje PRINCIPAL (afirmaciones clínicas agregadas).
+   Si no, usa «hallazgos_agregados_terapeutica». Responde por eje clínico (SGLT2, GLP-1, DOAC…),
+   NO repitas paper por paper. Si hay «claims_clinicos» con contradicting, menciona matiz explícito.
+   Los bloques ### PMID son soporte; el cierre debe sintetizar por terapia/outcome.
+   Si predominan estudios mechanistic/preclínicos, dilo. No uses «Síntesis sobre la comparación
+   solicitada» salvo que la pregunta pida comparación directa.
 
 CALIBRACIÓN Y TIERS (JSON «calibracion_sintesis» y «citas_pubmed»):
 - Si «calibracion_sintesis.retrieval_outcome» es «partial_primary_miss», indica que la búsqueda PubMed
@@ -88,6 +92,127 @@ REGLAS ABSOLUTAS:
 - No des diagnósticos individuales ni prescripciones; orienta a revisar fuentes y protocolos del centro.
 - No uses tablas markdown; párrafos y viñetas simples bajo cada sección ##.
 - Salida: solo las dos secciones ## (sin prefacio tipo "Aquí tienes")."""
+
+# Versión corta para modelos locales con ventana pequeña (p. ej. Llama 3.2 3B en llama-server).
+_SYSTEM_SYNTHESIS_CLAIM_FIRST = """Eres un médico experto que redacta respuestas clínicas orientativas en español.
+Recibes un JSON con cohorte SQL (si aplica) y «claims_clinicos»: afirmaciones clínicas agregadas
+con soporte, landmarks y contradicciones explícitas. NO recibes abstracts por paper.
+
+Tu respuesta DEBE tener SIEMPRE estas dos secciones, en este orden:
+
+## Datos locales (SQL)
+Igual que en modo estándar: cohorte, filtros, 0 pacientes ≠ ausencia de literatura si hay PMIDs en índice.
+
+## Evidencia bibliográfica (PubMed)
+PROHIBIDO escribir bloques «### PMID …» por artículo.
+Estructura OBLIGATORIA: un subapartado por cada entrada en «claims_clinicos.claims»:
+
+### Claim: {usa axis_label del JSON}
+- Redacta la afirmación clínica en 2-3 frases (solo lo que dice el claim).
+- Indica fuerza de evidencia, consistencia y aplicabilidad del JSON.
+- Cita landmarks de «landmark_support» y PMIDs de «support» (no inventes otros).
+- Si «contradicting» no está vacío, párrafo breve de matiz (no reconcilies en silencio).
+
+Al final, párrafo titulado exactamente **Síntesis sobre la pregunta clínica** (o **Síntesis sobre la
+comparación solicitada** si «pregunta_pide_comparacion_terapeutica_directa» es true), integrando
+los claims como razonamiento clínico — NO enumeres papers uno a uno.
+
+REGLAS:
+- Usa SOLO «claims_clinicos» e «indice_pmids» para trazabilidad; no inventes cifras ni PMIDs.
+- «indice_pmids» es solo referencia; no redactes un bloque por cada ítem del índice.
+- Respeta «calibracion_sintesis» (cautela si retrieval_confidence baja).
+- No prescripciones individuales; orienta a protocolos y fuentes primarias."""
+
+_SYSTEM_SYNTHESIS_COMPACT = """Eres un médico que redacta respuestas orientativas en español.
+Usa SOLO el JSON del usuario. Salida: exactamente dos secciones ## en este orden:
+
+## Datos locales (SQL)
+Resume cohorte SQL (n, filtros). Si hay PMIDs en el JSON, NO digas que no hay evidencia.
+
+## Evidencia bibliográfica (PubMed)
+Por cada cita en «citas_pubmed», un bloque:
+### PMID {pmid} — {titulo}
+2-4 frases según título y extracto; no inventes cifras ni PMIDs.
+Respeta «calibracion_sintesis» y «nivel_epistemico_busqueda» (tier alto = cautela).
+Cierra con «Síntesis sobre la pregunta clínica» o «Síntesis sobre la comparación solicitada»
+según «pregunta_pide_comparacion_terapeutica_directa». Prioriza «claims_clinicos_resumen»;
+si no, «hallazgos_agregados_terapeutica». Cierre por eje clínico, no paper por paper.
+Sin tablas ni prefacios."""
+
+# Prompts mínimos para síntesis en ventanas (una llamada ≈ un fragmento).
+_SYSTEM_WINDOW_SQL = (
+    "Redacta SOLO la sección «## Datos locales (SQL)» en español, usando únicamente el JSON. "
+    "Sin sección PubMed. Si no hay cohorte SQL, indícalo en una frase."
+)
+_SYSTEM_WINDOW_PMID = (
+    "Redacta SOLO bloques «### PMID … — título» (uno por cita del JSON), 2-4 frases cada uno. "
+    "Sin sección ## ni párrafo de cierre. No inventes cifras."
+)
+_SYSTEM_WINDOW_CLOSING = (
+    "Redacta SOLO un párrafo de cierre en español (sin encabezado ##). "
+    "Usa el título exacto indicado en el mensaje del usuario. "
+    "Si el JSON incluye claims_clinicos_resumen, sintetiza por afirmaciones clínicas (eje); "
+    "si no, hallazgos_agregados_terapeutica. No enumeres papers uno a uno. "
+    "Menciona contradicting si existe."
+)
+
+
+def _synthesis_windowed_mode() -> str:
+    """
+    ``off`` | ``auto`` (default) | ``on``.
+
+    - auto: ventanas solo tras error de contexto en llamada monolítica.
+    - on: siempre ventanas (útil en llama.cpp con n_ctx pequeño).
+    """
+    return (os.getenv("COPILOT_SYNTHESIS_WINDOWED") or "auto").strip().lower()
+
+
+def _synthesis_use_windowed_proactively() -> bool:
+    return _synthesis_windowed_mode() in ("1", "true", "yes", "on", "always")
+
+
+def _synthesis_pmids_per_window() -> int:
+    return max(1, min(4, _env_int("COPILOT_SYNTHESIS_PMIDS_PER_WINDOW", 1)))
+
+
+def _synthesis_compact_prompt_default() -> bool:
+    """Perfil llamacpp o flag explícito → system prompt compacto (menos tokens)."""
+    flag = (os.getenv("COPILOT_SYNTHESIS_COMPACT_PROMPT") or "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off"):
+        return False
+    prof = (os.getenv("COPILOT_LLM_PROFILE") or "").strip().lower()
+    return prof in ("llamacpp", "llama_cpp", "ollama", "local")
+
+
+def synthesis_system_prompt(
+    *, compact: bool | None = None, claim_first: bool = False
+) -> str:
+    if claim_first:
+        return _SYSTEM_SYNTHESIS_CLAIM_FIRST
+    use_compact = _synthesis_compact_prompt_default() if compact is None else compact
+    return _SYSTEM_SYNTHESIS_COMPACT if use_compact else _SYSTEM_SYNTHESIS
+
+
+def facts_use_claim_first(facts: dict[str, Any]) -> bool:
+    if facts.get("sintesis_modo") == "claim_first":
+        return True
+    cb = facts.get("claims_clinicos")
+    return isinstance(cb, dict) and bool(cb.get("claims"))
+
+
+def _is_context_size_exceeded(exc: BaseException) -> bool:
+    blob = str(exc).lower()
+    if "context size" in blob or "context length" in blob:
+        return True
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        try:
+            blob += " " + (resp.text or "").lower()
+        except Exception:
+            pass
+    return "context size" in blob or "context length" in blob
 
 
 from app.capabilities.evidence_rag.clinical_knowledge import landmark_synthesis_hint  # noqa: E402
@@ -157,7 +282,7 @@ def _clinical_intent_from_state(intent_raw: Any) -> ClinicalIntent | None:
     return None
 
 
-def _compact_facts_json(state: Dict[str, Any], medical_answer: Dict[str, Any]) -> str:
+def _build_facts_dict(state: Dict[str, Any], medical_answer: Dict[str, Any]) -> dict[str, Any]:
     uq = (state.get("user_query") or "").strip()
     if len(uq) > 600:
         uq = uq[:597].rstrip() + "…"
@@ -249,9 +374,40 @@ def _compact_facts_json(state: Dict[str, Any], medical_answer: Dict[str, Any]) -
     cal = calibration_from_state(state)
     cal_dict: dict[str, Any] | None = cal.to_dict() if cal else None
 
+    agg_block = medical_answer.get("aggregated_findings")
+    if not isinstance(agg_block, str) or not agg_block.strip():
+        from app.capabilities.evidence_rag.evidence_aggregation import (
+            aggregate_therapeutic_findings_from_state,
+        )
+
+        agg_block = aggregate_therapeutic_findings_from_state(state)
+
+    claim_bundle = medical_answer.get("clinical_claim_bundle")
+    claims_summary = medical_answer.get("clinical_claims_summary")
+    if not isinstance(claims_summary, str) or not claims_summary.strip():
+        from app.capabilities.evidence_rag.claim_extraction import (
+            extract_claims_from_state,
+            render_claim_bundle_markdown,
+        )
+
+        _b = extract_claims_from_state(state)
+        if _b.claims:
+            claim_bundle = _b.to_dict()
+            claims_summary = render_claim_bundle_markdown(_b)
+
+    claim_first = bool(
+        isinstance(claim_bundle, dict) and (claim_bundle or {}).get("claims")
+    )
+    indice_pmids = [
+        {"pmid": str(r.get("pmid") or ""), "titulo": str(r.get("titulo") or "")[:200]}
+        for r in cite_rows
+        if r.get("pmid")
+    ]
+
     facts: dict[str, Any] = {
         "pregunta_usuario": uq,
         "pregunta_pide_comparacion_terapeutica_directa": asks_comparison,
+        "sintesis_modo": "claim_first" if claim_first else "paper_centric",
         "predominan_estudios_mecanisticos": bool(cite_rows)
         and all(
             r.get("solo_mecanismos_o_preclinico") for r in cite_rows if isinstance(r, dict)
@@ -261,7 +417,6 @@ def _compact_facts_json(state: Dict[str, Any], medical_answer: Dict[str, Any]) -
         "mensaje_cohorte_sql": summary_sql or None,
         "cohorte_texto": medical_answer.get("cohort_summary"),
         "tamano_cohorte": cohort_size,
-        # True = 0 pacientes por criterios SQL/BD, no por ausencia de literatura.
         "cohorte_vacia_por_filtros_sql": cohort_zero_no_evidence,
         "num_referencias_pubmed": len(cite_rows),
         "num_pmids_unicos": len(cite_rows),
@@ -275,12 +430,319 @@ def _compact_facts_json(state: Dict[str, Any], medical_answer: Dict[str, Any]) -
             for x in (medical_answer.get("applicability_notes") or [])[:8]
             if str(x).strip()
         ],
-        "citas_pubmed": cite_rows,
         "calibracion_sintesis": cal_dict,
         "cohorte_local_solo_contexto": route in ("hybrid", "sql"),
+        "hallazgos_agregados_terapeutica": (agg_block or None),
+        "claims_clinicos": claim_bundle,
+        "claims_clinicos_resumen": (claims_summary or None),
+        "indice_pmids": indice_pmids,
     }
+    if claim_first:
+        facts["citas_pubmed"] = []
+        facts["instruccion_sintesis"] = (
+            "Modo claim-first: redacta por afirmaciones clínicas en claims_clinicos; "
+            "no uses bloques ### PMID por paper."
+        )
+    else:
+        facts["citas_pubmed"] = cite_rows
 
-    return json.dumps(facts, ensure_ascii=False, indent=2)
+    return facts
+
+
+def _compact_facts_json(state: Dict[str, Any], medical_answer: Dict[str, Any]) -> str:
+    return json.dumps(_build_facts_dict(state, medical_answer), ensure_ascii=False, indent=2)
+
+
+def _llm_synthesis_chat(
+    *,
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    system: str,
+    user: str,
+    max_tokens: int,
+    temperature: float,
+    timeout_s: float,
+) -> str:
+    return _openai_chat_completion_text(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        system=system,
+        user=user,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout_s=timeout_s,
+    )
+
+
+def _extract_markdown_section(text: str, heading: str) -> str:
+    """Fragmento desde ``heading`` hasta el siguiente ``## `` o fin."""
+    body = strip_code_fence(text).strip()
+    if heading not in body:
+        return body
+    start = body.find(heading)
+    chunk = body[start:]
+    nxt = re.search(r"\n##(?!\#)", chunk[len(heading) :])
+    if nxt:
+        chunk = chunk[: len(heading) + nxt.start()]
+    return chunk.strip()
+
+
+def _extract_pmid_blocks_only(text: str) -> str:
+    """Conserva solo subapartados ``### PMID …``."""
+    body = strip_code_fence(text).strip()
+    parts = re.split(r"(?=^### PMID \d+\b)", body, flags=re.MULTILINE)
+    blocks = [p.strip() for p in parts if p.strip().startswith("### PMID")]
+    return "\n\n".join(blocks)
+
+
+def _closing_title(asks_comparison: bool) -> str:
+    if asks_comparison:
+        return "Síntesis sobre la comparación solicitada"
+    return "Síntesis sobre la pregunta clínica"
+
+
+def _synthesis_narrative_claim_first(
+    facts: dict[str, Any],
+    *,
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    timeout_s: float,
+) -> tuple[str | None, list[str]]:
+    """Una sola llamada: SQL + claims (sin ventanas PMID)."""
+    warns: list[str] = ["synthesis_llm: modo claim-first (sin abstracts por paper)"]
+    uq = str(facts.get("pregunta_usuario") or "")
+    asks_cmp = bool(facts.get("pregunta_pide_comparacion_terapeutica_directa"))
+    cierre = (
+        "Cierra con «Síntesis sobre la comparación solicitada»."
+        if asks_cmp
+        else "Cierra con «Síntesis sobre la pregunta clínica»."
+    )
+    payload = {
+        k: facts.get(k)
+        for k in (
+            "pregunta_usuario",
+            "pregunta_pide_comparacion_terapeutica_directa",
+            "sintesis_modo",
+            "claims_clinicos",
+            "claims_clinicos_resumen",
+            "indice_pmids",
+            "calibracion_sintesis",
+            "mensaje_cohorte_sql",
+            "cohorte_texto",
+            "tamano_cohorte",
+            "cohorte_vacia_por_filtros_sql",
+            "num_referencias_pubmed",
+            "instruccion_sintesis",
+        )
+    }
+    user_body = (
+        "Redacta la respuesta con exactamente dos secciones ##:\n"
+        "## Datos locales (SQL)\n"
+        "## Evidencia bibliográfica (PubMed)\n\n"
+        "Usa SOLO claims_clinicos (un ### Claim por entrada). "
+        f"PROHIBIDO ### PMID por paper. {cierre}\n\n"
+        "HECHOS_JSON:\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+    try:
+        raw = _llm_synthesis_chat(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            system=synthesis_system_prompt(claim_first=True),
+            user=user_body,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout_s=timeout_s,
+        )
+        return strip_code_fence(raw).strip() or None, warns
+    except Exception as exc:  # noqa: BLE001
+        warns.append(f"synthesis_llm claim-first: {exc}")
+        summary = facts.get("claims_clinicos_resumen")
+        if isinstance(summary, str) and summary.strip():
+            sql = (facts.get("mensaje_cohorte_sql") or facts.get("cohorte_texto") or "").strip()
+            sql_block = "## Datos locales (SQL)\n\n" + (
+                sql or "Cohorte local no disponible."
+            )
+            return f"{sql_block}\n\n{summary.strip()}", warns
+        return None, warns
+
+
+def _synthesis_narrative_windowed(
+    facts: dict[str, Any],
+    *,
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    timeout_s: float,
+) -> tuple[str | None, list[str]]:
+    """
+    Síntesis en varias llamadas pequeñas: SQL → PMIDs (ventanas) → párrafo de cierre.
+    """
+    if facts_use_claim_first(facts):
+        return _synthesis_narrative_claim_first(
+            facts,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout_s=timeout_s,
+        )
+
+    warns: list[str] = [
+        "synthesis_llm: modo ventanas (varias llamadas) por límite de contexto del servidor"
+    ]
+    route = str(facts.get("ruta_pipeline") or "")
+    asks_cmp = bool(facts.get("pregunta_pide_comparacion_terapeutica_directa"))
+    cites: list[dict[str, Any]] = [
+        c for c in (facts.get("citas_pubmed") or []) if isinstance(c, dict)
+    ]
+    sub_max = max(128, min(768, max_tokens // 2))
+
+    sql_section = ""
+    if route in ("hybrid", "sql"):
+        sql_payload = {
+            k: facts.get(k)
+            for k in (
+                "pregunta_usuario",
+                "mensaje_cohorte_sql",
+                "cohorte_texto",
+                "tamano_cohorte",
+                "cohorte_vacia_por_filtros_sql",
+                "cohorte_local_solo_contexto",
+                "num_referencias_pubmed",
+            )
+        }
+        try:
+            raw_sql = _llm_synthesis_chat(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                system=_SYSTEM_WINDOW_SQL,
+                user="JSON:\n" + json.dumps(sql_payload, ensure_ascii=False),
+                max_tokens=sub_max,
+                temperature=temperature,
+                timeout_s=timeout_s,
+            )
+            sql_section = _extract_markdown_section(raw_sql, "## Datos locales (SQL)")
+        except Exception as exc:  # noqa: BLE001
+            warns.append(f"synthesis_llm ventana SQL: {exc}")
+            summary = (facts.get("mensaje_cohorte_sql") or facts.get("cohorte_texto") or "").strip()
+            sql_section = "## Datos locales (SQL)\n\n" + (
+                summary or "Cohorte local no disponible en esta respuesta."
+            )
+    else:
+        sql_section = (
+            "## Datos locales (SQL)\n\n"
+            "No aplica: la consulta se resolvió solo con evidencia bibliográfica (PubMed)."
+        )
+
+    pmid_parts: list[str] = []
+    per_win = _synthesis_pmids_per_window()
+    if not cites:
+        pmid_parts.append(
+            "_No se recuperaron referencias PubMed indexadas para esta pregunta._"
+        )
+    else:
+        for batch in _chunk_list(cites, per_win):
+            mini = {
+                "pregunta_usuario": facts.get("pregunta_usuario"),
+                "calibracion_sintesis": facts.get("calibracion_sintesis"),
+                "citas_pubmed": batch,
+            }
+            try:
+                raw_p = _llm_synthesis_chat(
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=model,
+                    system=_SYSTEM_WINDOW_PMID,
+                    user="JSON:\n" + json.dumps(mini, ensure_ascii=False),
+                    max_tokens=sub_max,
+                    temperature=temperature,
+                    timeout_s=timeout_s,
+                )
+                block = _extract_pmid_blocks_only(raw_p)
+                if block:
+                    pmid_parts.append(block)
+            except Exception as exc:  # noqa: BLE001
+                warns.append(f"synthesis_llm ventana PMID: {exc}")
+                for row in batch:
+                    pm = str(row.get("pmid") or "").strip()
+                    title = str(row.get("title") or "").strip()
+                    snip = str(row.get("extracto_del_resumen_indexado") or "").strip()[:280]
+                    if pm:
+                        pmid_parts.append(
+                            f"### PMID {pm} — {title}\n"
+                            f"{snip or 'Extracto no disponible; revisar PubMed.'}"
+                        )
+
+    closing_title = _closing_title(asks_cmp)
+    study_lines = [
+        f"- PMID {c.get('pmid')}: {c.get('title')}"
+        for c in cites
+        if c.get("pmid")
+    ]
+    closing_payload = {
+        "pregunta_usuario": facts.get("pregunta_usuario"),
+        "calibracion_sintesis": facts.get("calibracion_sintesis"),
+        "pregunta_pide_comparacion_terapeutica_directa": asks_cmp,
+        "hallazgos_agregados_terapeutica": facts.get("hallazgos_agregados_terapeutica"),
+        "claims_clinicos_resumen": facts.get("claims_clinicos_resumen"),
+        "claims_clinicos": facts.get("claims_clinicos"),
+        "estudios_ya_redactados": study_lines[:8],
+    }
+    closing_user = (
+        f"Escribe el párrafo titulado exactamente «{closing_title}».\n\n"
+        "JSON:\n"
+        + json.dumps(closing_payload, ensure_ascii=False)
+    )
+    closing_text = ""
+    try:
+        raw_c = _llm_synthesis_chat(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            system=_SYSTEM_WINDOW_CLOSING,
+            user=closing_user,
+            max_tokens=sub_max,
+            temperature=temperature,
+            timeout_s=timeout_s,
+        )
+        closing_body = strip_code_fence(raw_c).strip()
+        if closing_title in closing_body:
+            idx = closing_body.find(closing_title)
+            closing_text = closing_body[idx:].strip()
+        else:
+            closing_text = f"**{closing_title}**\n\n{closing_body}"
+    except Exception as exc:  # noqa: BLE001
+        warns.append(f"synthesis_llm ventana cierre: {exc}")
+        closing_text = (
+            f"**{closing_title}**\n\n"
+            "Revise los PMIDs citados y la calibración de recuperación antes de aplicar "
+            "conclusiones clínicas."
+        )
+
+    pubmed_body = "\n\n".join(p for p in pmid_parts if p.strip())
+    assembled = (
+        f"{sql_section.rstrip()}\n\n"
+        f"## Evidencia bibliográfica (PubMed)\n\n"
+        f"{pubmed_body.rstrip()}\n\n"
+        f"{closing_text.rstrip()}"
+    ).strip()
+    return assembled if assembled else None, warns
+
+
+def _chunk_list(items: list[Any], size: int) -> list[list[Any]]:
+    n = max(1, size)
+    return [items[i : i + n] for i in range(0, len(items), n)]
 
 
 _PMID_SECTION_HEAD = re.compile(r"^### PMID (\d+)\b", re.MULTILINE)
@@ -358,57 +820,111 @@ def try_llm_synthesis_narrative(
     timeout_s = max(5.0, min(600.0, _env_float("COPILOT_SYNTHESIS_TIMEOUT", 120.0)))
     temperature = 0.0
 
-    facts_json = _compact_facts_json(state, medical_answer)
+    facts = _build_facts_dict(state, medical_answer)
+    facts_json = json.dumps(facts, ensure_ascii=False, indent=2)
     uq = (state.get("user_query") or "").strip()
     asks_cmp = question_requests_direct_therapeutic_comparison(uq)
-    cierre = (
-        "Cierra PubMed con el párrafo «Síntesis sobre la comparación solicitada» "
-        "(comparación directa entre opciones de la pregunta)."
-        if asks_cmp
-        else "Cierra PubMed con el párrafo «Síntesis sobre la pregunta clínica» "
-        "(no uses el título de comparación directa)."
-    )
-    user_body = (
-        "Redacta la respuesta con exactamente dos secciones markdown:\n"
-        "## Datos locales (SQL)\n"
-        "## Evidencia bibliográfica (PubMed)\n\n"
-        "Usa SOLO el JSON. Escribe exactamente «num_pmids_unicos» bloques ### PMID (uno por "
-        f"cita), sin repetir ningún PMID ni añadir bloques extra. {cierre} "
-        "Parafrasea; no copies extractos largos.\n\n"
-        "HECHOS_JSON:\n"
-        f"{facts_json}"
-    )
+    claim_first = facts_use_claim_first(facts)
 
-    try:
-        raw = _openai_chat_completion_text(
-            base_url=base,
-            api_key=api_key,
-            model=model,
-            system=_SYSTEM_SYNTHESIS,
-            user=user_body,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            timeout_s=timeout_s,
+    if claim_first:
+        cierre = (
+            "Cierra con «Síntesis sobre la comparación solicitada»."
+            if asks_cmp
+            else "Cierra con «Síntesis sobre la pregunta clínica»."
         )
-    except Exception as exc:  # noqa: BLE001 — síntesis: fallback silencioso
-        warns.append(f"synthesis_llm: fallo de red o servidor ({exc})")
-        return None, warns
+        user_body = (
+            "Redacta la respuesta con exactamente dos secciones markdown:\n"
+            "## Datos locales (SQL)\n"
+            "## Evidencia bibliográfica (PubMed)\n\n"
+            "Modo claim-first: un ### Claim por cada entrada en claims_clinicos.claims. "
+            f"PROHIBIDO bloques ### PMID por paper. {cierre}\n\n"
+            "HECHOS_JSON:\n"
+            f"{facts_json}"
+        )
+    else:
+        cierre = (
+            "Cierra PubMed con el párrafo «Síntesis sobre la comparación solicitada» "
+            "(comparación directa entre opciones de la pregunta)."
+            if asks_cmp
+            else "Cierra PubMed con el párrafo «Síntesis sobre la pregunta clínica» "
+            "(no uses el título de comparación directa)."
+        )
+        user_body = (
+            "Redacta la respuesta con exactamente dos secciones markdown:\n"
+            "## Datos locales (SQL)\n"
+            "## Evidencia bibliográfica (PubMed)\n\n"
+            "Usa SOLO el JSON. Escribe exactamente «num_pmids_unicos» bloques ### PMID (uno por "
+            f"cita), sin repetir ningún PMID ni añadir bloques extra. {cierre} "
+            "Parafrasea; no copies extractos largos.\n\n"
+            "HECHOS_JSON:\n"
+            f"{facts_json}"
+        )
 
-    text = strip_code_fence(raw)
+    chat_kw = dict(
+        base_url=base,
+        api_key=api_key,
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        timeout_s=timeout_s,
+    )
+
+    def _finalize(text: str) -> str:
+        text = dedupe_pmid_sections(text)
+        text = _inject_tier_provenance_in_pmid_sections(text, facts_json)
+        text = _sanitize_prompt_leakage(text)
+        text = _sanitize_no_evidence_claim(text, medical_answer)
+        text = _sanitize_extrapolated_efficacy(text, facts_json)
+        cal = calibration_from_state(state)
+        if cal is not None:
+            text = _sanitize_overconfident_synthesis(text, cal)
+        if len(text) > 14_000:
+            text = text[:13_997].rstrip() + "…"
+        return text
+
+    if _synthesis_use_windowed_proactively():
+        text_w, w_win = _synthesis_narrative_windowed(facts, **chat_kw)
+        if text_w:
+            warns.extend(w_win)
+            return _finalize(text_w), warns
+        warns.extend(w_win)
+
+    system = synthesis_system_prompt(claim_first=claim_first)
+    raw: str | None = None
+    try:
+        raw = _llm_synthesis_chat(system=system, user=user_body, **chat_kw)
+    except Exception as exc:  # noqa: BLE001 — síntesis: fallback silencioso
+        if system != _SYSTEM_SYNTHESIS_COMPACT and _is_context_size_exceeded(exc):
+            try:
+                raw = _llm_synthesis_chat(
+                    system=_SYSTEM_SYNTHESIS_COMPACT,
+                    user=user_body,
+                    **chat_kw,
+                )
+                warns.append(
+                    "synthesis_llm: prompt compacto por límite de contexto del servidor local"
+                )
+            except Exception as exc2:  # noqa: BLE001
+                exc = exc2
+                raw = None
+        if raw is None and _is_context_size_exceeded(exc) and _synthesis_windowed_mode() != "off":
+            text_w, w_win = _synthesis_narrative_windowed(facts, **chat_kw)
+            if text_w:
+                warns.extend(w_win)
+                return _finalize(text_w), warns
+            warns.extend(w_win)
+            warns.append(f"synthesis_llm: ventanas fallaron tras contexto excedido ({exc})")
+            return None, warns
+        if raw is None:
+            warns.append(f"synthesis_llm: fallo de red o servidor ({exc})")
+            return None, warns
+
+    text = strip_code_fence(raw or "")
     if not text:
         warns.append("synthesis_llm: respuesta vacía del modelo")
         return None, warns
 
-    text = dedupe_pmid_sections(text)
-    text = _inject_tier_provenance_in_pmid_sections(text, facts_json)
-    text = _sanitize_no_evidence_claim(text, medical_answer)
-    text = _sanitize_extrapolated_efficacy(text, facts_json)
-    cal = calibration_from_state(state)
-    if cal is not None:
-        text = _sanitize_overconfident_synthesis(text, cal)
-    if len(text) > 14_000:
-        text = text[:13_997].rstrip() + "…"
-    return text, warns
+    return _finalize(text), warns
 
 
 _NO_EVIDENCE_PATTERNS = re.compile(
@@ -469,6 +985,52 @@ _OVERCONFIDENT_PATTERNS = re.compile(
     r"superioridad\s+clara|eficacia\s+comprobada|evidencia\s+contundente)",
     re.I,
 )
+
+
+_PROMPT_LEAK_MARKERS = (
+    re.compile(r"Resume cohorte SQL.*NO diga que no hay evidencia", re.I | re.S),
+    re.compile(r"Usa SOLO el JSON del usuario", re.I),
+    re.compile(r"Redacta SOLO la sección", re.I),
+    re.compile(r"Redacta SOLO bloques", re.I),
+    re.compile(r"HECHOS_JSON\s*:", re.I),
+    re.compile(r"exactamente dos secciones\s*##", re.I),
+    re.compile(r"PROHIBIDO copiar listas", re.I),
+    re.compile(r"Sin sección PubMed", re.I),
+)
+
+
+def _sanitize_prompt_leakage(text: str) -> str:
+    """Elimina fragmentos del system prompt que el LLM local a veces copia."""
+    if not text or not text.strip():
+        return text
+    out = text
+    for pat in _PROMPT_LEAK_MARKERS:
+        out = pat.sub("", out)
+    # Líneas sueltas con instrucciones internas bajo ## Datos locales
+    cleaned: list[str] = []
+    for line in out.splitlines():
+        low = line.lower().strip()
+        if "resume cohorte sql" in low and "no diga" in low:
+            continue
+        if low.startswith("usa solo el json"):
+            continue
+        cleaned.append(line)
+    out = "\n".join(cleaned)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    if "## Datos locales (SQL)" in out:
+        parts = out.split("## Datos locales (SQL)", 1)
+        if len(parts) == 2:
+            body = parts[1].split("##", 1)[0].strip()
+            if not body or len(body) < 12:
+                out = (
+                    out.replace(
+                        "## Datos locales (SQL)",
+                        "## Datos locales (SQL)\n\n"
+                        "Resumen de cohorte local no disponible en esta respuesta.",
+                        1,
+                    )
+                )
+    return out
 
 
 def _sanitize_overconfident_synthesis(text: str, cal: SynthesisCalibration) -> str:

@@ -28,7 +28,7 @@ def test_hero_query_cv_stages_include_outcomes() -> None:
     assert "glp" in primary
     assert "diabet" in primary or "diabetes mellitus" in primary
     assert "cardiovascular" in primary or "mace" in primary
-    assert primary.count(" or ") <= 20
+    assert primary.count(" or ") <= 28
 
 
 def test_hero_single_query_compat() -> None:

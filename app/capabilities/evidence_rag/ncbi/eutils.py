@@ -335,6 +335,26 @@ def esearch_pubmed_detailed(
             out["result_count"] = int(str(cnt))
         ids = res.get("idlist") or []
         out["idlist"] = [str(x) for x in ids]
+        
+        # INTRA-STAGE FALLBACK: Si pusimos filtro de fecha y dio 0 hits, re-ejecutamos de inmediato sin límite de fecha
+        if not out["idlist"] and datetype == "pdat":
+            fallback_params = params.copy()
+            for k in ("datetype", "mindate", "maxdate"):
+                fallback_params.pop(k, None)
+            
+            try:
+                r_fall = client.get(url, params=fallback_params)
+                if r_fall.status_code < 400:
+                    data_fall = r_fall.json()
+                    res_fall = data_fall.get("esearchresult") or {}
+                    if not (res_fall.get("ERROR") or res_fall.get("ErrorMsg")):
+                        fall_ids = res_fall.get("idlist") or []
+                        out["idlist"] = [str(x) for x in fall_ids]
+                        if "count" in res_fall and str(res_fall["count"]).isdigit():
+                            out["result_count"] = int(str(res_fall["count"]))
+            except Exception:
+                pass # Si el fallback falla por red, mantenemos el resultado original (0 hits)
+
     except httpx.TimeoutException as exc:
         out["error"] = f"timeout esearch: {exc}"
     except httpx.HTTPStatusError as exc:

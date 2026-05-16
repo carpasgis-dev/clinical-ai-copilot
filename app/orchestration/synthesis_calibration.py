@@ -23,6 +23,7 @@ class SynthesisCalibration:
     retrieval_outcome: str = "pending"  # success | partial_primary_miss | full_miss | zero_hits_all_stages
     dominant_retrieval_tier: int = 99
     retrieval_confidence: float = 0.0
+    clinical_answer_confidence: float = 0.0
     evidence_specificity: float = 0.0
     applicability_confidence: float = 0.0
     primary_stage_hit: bool = False
@@ -69,6 +70,17 @@ def calculate_synthesis_calibration(state: dict[str, Any]) -> SynthesisCalibrati
     articles = evidence_bundle.get("articles") or []
 
     top_articles = deduplicate_citations([a for a in articles if isinstance(a, dict)])
+
+    def _rank_key(a: dict[str, Any]) -> float:
+        fr = a.get("final_rank_score")
+        if fr is not None:
+            return float(fr)
+        dbg = a.get("rank_score_debug")
+        if isinstance(dbg, dict) and dbg.get("final_fusion") is not None:
+            return float(dbg["final_fusion"])
+        return 0.0
+
+    top_articles.sort(key=_rank_key, reverse=True)
     top_n = 6
     top_articles = top_articles[:top_n]
 
@@ -95,13 +107,33 @@ def calculate_synthesis_calibration(state: dict[str, Any]) -> SynthesisCalibrati
             cal.retrieval_outcome = "partial_primary_miss"
 
     if cal.retrieval_outcome == "success" and cal.dominant_retrieval_tier <= 2:
-        cal.retrieval_confidence = 1.0
+        cal.retrieval_confidence = 0.85
     elif cal.retrieval_outcome == "partial_primary_miss" and cal.dominant_retrieval_tier <= 2:
-        cal.retrieval_confidence = 0.6
+        cal.retrieval_confidence = 0.55
     elif cal.dominant_retrieval_tier >= 4:
         cal.retrieval_confidence = 0.35
     else:
-        cal.retrieval_confidence = 0.5
+        cal.retrieval_confidence = 0.45
+
+    from app.capabilities.evidence_rag.clinical_answerability import (
+        clinical_answerability_score,
+    )
+    from app.capabilities.evidence_rag.evidence_rerank import infer_study_type_from_title
+
+    ans_scores: list[float] = []
+    weak_n = 0
+    for a in top_articles:
+        tit = str(a.get("title") or "")
+        snip = str(a.get("abstract_snippet") or "")
+        st = infer_study_type_from_title(tit)
+        ans = clinical_answerability_score(st, tit, snip)
+        ans_scores.append(ans)
+        if ans < 0.4:
+            weak_n += 1
+    if ans_scores:
+        cal.clinical_answer_confidence = round(sum(ans_scores) / len(ans_scores), 3)
+    if len(top_articles) >= 2 and weak_n * 2 >= len(top_articles):
+        cal.clinical_answer_confidence = min(cal.clinical_answer_confidence, 0.35)
 
     cal.landmark_present = any(
         match_diabetes_cvot_landmark(a.get("title", ""), a.get("abstract_snippet", ""))
@@ -122,9 +154,12 @@ def calculate_synthesis_calibration(state: dict[str, Any]) -> SynthesisCalibrati
     num_specific = high_outcome_alignment + landmark_n
     cal.evidence_specificity = min(1.0, num_specific / len(top_articles)) if top_articles else 0.0
 
-    cal.applicability_confidence = (
-        sum(applicability_scores) / len(applicability_scores) if applicability_scores else 0.0
-    )
+    if applicability_scores:
+        # applicability_score en artículo es multiplicador ~0.5–1.25; normalizar a 0–1
+        normed = [min(1.0, max(0.0, (float(s) - 0.45) / 0.8)) for s in applicability_scores]
+        cal.applicability_confidence = round(sum(normed) / len(normed), 3)
+    else:
+        cal.applicability_confidence = 0.0
 
     return cal
 
@@ -140,6 +175,7 @@ def calibration_from_state(state: dict[str, Any]) -> SynthesisCalibration | None
             retrieval_outcome=str(raw.get("retrieval_outcome") or "pending"),
             dominant_retrieval_tier=int(raw.get("dominant_retrieval_tier") or 99),
             retrieval_confidence=float(raw.get("retrieval_confidence") or 0.0),
+            clinical_answer_confidence=float(raw.get("clinical_answer_confidence") or 0.0),
             evidence_specificity=float(raw.get("evidence_specificity") or 0.0),
             applicability_confidence=float(raw.get("applicability_confidence") or 0.0),
             primary_stage_hit=bool(raw.get("primary_stage_hit")),

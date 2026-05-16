@@ -51,7 +51,8 @@ def test_calculate_calibration_partial_primary_miss() -> None:
     cal = calculate_synthesis_calibration(state)
     assert cal.retrieval_outcome == "partial_primary_miss"
     assert cal.dominant_retrieval_tier == 2
-    assert cal.retrieval_confidence == 0.6
+    assert cal.retrieval_confidence == 0.55
+    assert cal.clinical_answer_confidence > 0.5
 
 
 def test_tier_aware_leadin_high_tier() -> None:

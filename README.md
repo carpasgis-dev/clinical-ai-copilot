@@ -1,189 +1,178 @@
-# Clinical Evidence Copilot
+# Clinical Evidence Copilot 🩺🤖
 
-> Copiloto de IA clínica que combina datos estructurados (SQL/FHIR/Synthea)
-> con evidencia biomédica fundamentada (PubMed / Europe PMC, PMIDs verificables).
+![Python](https://img.shields.io/badge/python-3.11+-blue.svg)
+![FastAPI](https://img.shields.io/badge/FastAPI-async-green.svg)
+![LangGraph](https://img.shields.io/badge/LangGraph-orchestration-orange.svg)
+![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)
+![Status](https://img.shields.io/badge/status-experimental-yellow.svg)
 
-## Visión
+Copiloto clínico experimental orientado a **evidencia biomédica real**. 
 
-Un copiloto healthcare-AI que decide de forma **determinista** si una consulta requiere
-**datos del paciente/centro** (SQL), **evidencia bibliográfica** o **ambas**,
-y orquesta el pipeline con **trazabilidad** (`trace`).
+Combina contexto estructurado de pacientes (SQL/FHIR/Synthea) con recuperación semántica sobre PubMed y Europe PMC, utilizando un **motor de ranking epistémico** que prioriza Ensayos Clínicos Aleatorizados (RCTs), Meta-Análisis y Guías Clínicas sobre evidencia mecanicista o preclínica.
 
-**Diferenciador:** routing sin LLM en el router; evidencia recuperada con APIs reales
-y citas con PMID; **recuperación PubMed amplia (heurística multi-etapa)** + **re-ranking clínico**
-(`ClinicalIntent` + alineación por eje PICO); planificación LLM opcional en traza (`pubmed_query`).
+Diseñado estrictamente para minimizar alucinaciones y mantener trazabilidad completa mediante PMIDs verificables.
 
----
-
-## Arquitectura
-
-```
-Usuario
-  │
-  ▼
-POST /query  →  LangGraph (router determinista)
-  │
-  ├─ SQL ──────────────► cohorte SQLite (NL heurístico → SQL seguro o conteo simple)
-  │
-  ├─ Evidence ─────────► pubmed_query (LLM, traza) + retrieve (heurística multi-etapa) → rerank → síntesis
-  │
-  └─ Hybrid ───────────► cohorte SQL → clinical_context → pubmed_query (traza) → retrieve → rerank → síntesis
-```
-
-### Pipeline de evidencia (PubMed)
-
-Diseño **recall amplio → precisión en rerank** (no filtrar todo en la query booleana):
-
-```
-pregunta + clinical_context
-        │
-        ▼
-extract_clinical_intent()     → ClinicalIntent (población, intervención, comparador, outcomes, priority_axis)
-        │
-        ▼
-build_evidence_search_queries()   ← heurística (lo que llama NCBI)
-        │   Plan adaptativo A→B→C (parada temprana en executor si hay ≥12 PMIDs):
-        │   A estricto (MACE/CVOT + edad MeSH si ≥65) → B moderado (cardiovascular benefit) → C amplio (solo si <5 PMIDs)
-        │   Temas: CV, safety, renal, glycemic (bloques distintos por `primary_outcome_theme`)
-        ▼
-NCBI esearch + efetch (por stage) → merge PMIDs → pool pre-rerank (hasta ~200, ``COPILOT_PUBMED_RETRIEVAL_POOL_MAX``)
-        │
-        ▼
-cheap filter: noise_suppression (temas laterales ×0.35–0.65, sin exclusión dura)
-        │
-        ▼
-rerank_article_dicts(..., clinical_intent)
-        │   heurística PICO + clinical_alignment + diseño de evidencia
-        │   query semántica: build_intent_semantic_query (inglés clínico, no texto ES crudo)
-        │   opcional (COPILOT_SEMANTIC_RERANK=full): bi-encoder top-K → cross-encoder → fusión
-        ▼
-top 6 → evidence_bundle → reasoning → síntesis
-```
-
-- **PubMed retrieval** (`heuristic_evidence_query.py`, multi-etapa en `executor`): stages A→B→C + `cv_evidence_hierarchy` (PubType suave) + `cvot_landmark`; ontología de desenlaces (`outcome_ontology.py`, MACE + componentes); memoria landmark (`clinical_knowledge.py`); supresión negativa intent-aware (`noise_suppression.py`). Tras ejecutar, **`pubmed_query` = query canónica real** (`pubmed_queries_executed` lista todas). Refinamiento LLM opcional: `COPILOT_PUBMED_LLM_REFINE=1`.
-- **Heurística** (`heuristic_evidence_query.py`): MeSH + `[tiab]` en población/intervención; comparador y edad no son AND duros en PubMed (van al rerank).
-- **Alineación** (`clinical_intent.py`, `clinical_alignment.py`): scores 0–1 por eje; penalización suave de off-topic (p. ej. depresión sin CV) solo sin señal CV; comparador «vs metformina» con frases explícitas.
-- **Deduplicación** (`evidence_dedup.py`): PMIDs/títulos/`evidence_statements` antes de síntesis.
-- **Capability** (`EvidenceCapability`): NCBI / Europe PMC / multi / stub.
-- **Síntesis** (`build_stub_medical_answer` + `llm_synthesis` opcional): `MedicalAnswer` estructurado; con `COPILOT_SYNTHESIS=llm`, `final_answer` narrativo desde JSON de hechos (incl. `intencion_clinica` y `alineacion_clinica` por PMID).
-- El grafo solo conoce `CopilotState` y los **Protocols** de `app/capabilities/contracts.py`.
+> **La similitud semántica no equivale a calidad clínica.** <br>
+> No inventa papers. No mezcla evidencia débil con fuerte. No responde sin trazabilidad.
 
 ---
 
-## Capabilities
+## ⚡ Quick Demo (Time to Insight)
 
-| Capability | Implementación v0.2 | Notas |
-|------------|----------------------|--------|
-| **A — Clinical SQL** | `SqliteClinicalCapability`, ETL Synthea (`scripts/synthea_csv_to_sqlite.py`), `cohort_nl` (NL → `WHERE` / `EXISTS` acotados) | Ver `docs/SYNTHEA.md` y `CLINICAL_DB_PATH`. |
-| **B — Evidence** | `NcbiEvidenceCapability`, `EuropePmcCapability`, `MultiSourceEvidenceCapability`, `StubEvidenceCapability` | E-utilities alineadas con PRSN; query compartida con Europe PMC |
+**Request** (`POST /query`):
+```json
+{
+  "query": "Paciente diabético mayor de 65 años con ERC. ¿Qué evidencia reciente existe sobre reducción de riesgo cardiovascular?",
+  "session_id": "demo-1"
+}
+```
+
+**Response**:
+```json
+{
+  "route": "hybrid",
+  "execution_plan": ["pubmed_query", "evidence_retrieval", "synthesis"],
+  "pmids": ["37212345", "38190012"],
+  "reasoning_state": {
+    "evidence_quality": "alta",
+    "evidence_assessments": [
+      {
+        "pmid": "37212345",
+        "study_type": "rct",
+        "applicability": "Alineación positiva: cohorte adulta mayor con comorbilidades concurrentes."
+      }
+    ]
+  },
+  "final_answer": "Los análisis clínicos recientes respaldan el uso de inhibidores de SGLT2... [1]",
+  "latency_ms": 842.3
+}
+```
 
 ---
 
-## API (FastAPI)
+## 🧠 ¿Por qué existe este proyecto?
 
-Desde la raíz del repo `clinical-ai-copilot`:
+La inmensa mayoría de los sistemas RAG (Retrieval-Augmented Generation) médicos optimizan simplemente la proximidad de sus *embeddings* vectoriales. Sin embargo, el razonamiento clínico no funciona así.
+
+Un paper mecanicista basado en modelos murinos (ratones) **nunca** debería posicionar por encima de un ensayo clínico aleatorizado fase III con 10,000 pacientes, incluso si sus embeddings comparten una similitud semántica altísima con la pregunta.
+
+Este proyecto explora arquitecturas RAG alineadas con la **jerarquía de la Medicina Basada en Evidencia (MBE)** en lugar de limitar el retrieval a la proximidad matemática pura.
+
+---
+
+## ✨ ¿Qué hace a este copiloto diferente?
+
+Este proyecto no es otro *wrapper* de ChatGPT. Su arquitectura está diseñada desde cero para el rigor clínico, con varias capas de control que no encontrarás en sistemas RAG genéricos:
+
+1.  **Búsqueda Guiada por Relevancia Clínica (PICO)**: En lugar de una simple búsqueda semántica, el sistema primero descompone la pregunta en un esquema PICO (Paciente, Intervención, Comparación, Desenlace). Esto permite construir consultas a PubMed mucho más precisas y ejecutar "escaleras de evidencia" automáticas, que van de lo más específico a lo más general si no se encuentran resultados, manteniendo siempre el control.
+
+2.  **Ranking Epistémico: La Calidad de la Evidencia Importa**: El núcleo del sistema es un motor de ranking que entiende la jerarquía de la evidencia médica. Un Ensayo Clínico Aleatorizado (RCT) siempre tendrá más peso que un estudio preclínico en ratones, incluso si este último es semánticamente más cercano a la pregunta. Esto se implementa con un multiplicador de puntuación basado en el tipo de estudio, previniendo que evidencia débil contamine la respuesta final.
+
+3.  **Filtro de Aplicabilidad Demográfica**: El sistema cruza automáticamente los datos del paciente (ej: "mujer de 72 años") con los de los estudios recuperados. Si un artículo trata sobre pediatría o una población completamente diferente, su puntuación se penaliza, evitando recomendaciones basadas en evidencia no aplicable.
+
+4.  **Síntesis Anti-Alucinaciones**: La generación de la respuesta final está fuertemente restringida. El LLM opera con `temperature=0.0` (máximo determinismo) y sobre un conjunto de "hechos" extraídos de los papers. Un post-proceso verifica que cada afirmación en la respuesta esté directamente respaldada por una cita (PMID), eliminando la invención de información.
+
+5.  **Enrutamiento Híbrido (SQL + RAG)**: El sistema es capaz de decidir de forma autónoma si la pregunta se responde mejor consultando una base de datos de pacientes locales (vía SQL) o buscando en la literatura médica externa (vía RAG), o una combinación de ambas. Esto permite respuestas que integran el contexto local con la evidencia global.
+
+---
+
+## 🩺 Casos de Uso y Consultas de Ejemplo
+
+El sistema está diseñado para resolver escenarios clínicos complejos que combinan el estado de una cohorte local (vía SQL) con la literatura biomédica mundial (vía PubMed/Europe PMC). Algunos ejemplos de consultas que el copiloto comprende y resuelve óptimamente:
+
+- **Riesgo Cardiometabólico (SGLT2 / GLP-1):** 
+  > *"En pacientes con diabetes e hipertensión ≥65 años, ¿qué evidencia hay sobre inhibidores SGLT2 o agonistas GLP-1 frente a solo metformina para reducir eventos cardiovasculares (MACE)?"*
+- **Anticoagulación y Fibrilación Auricular:** 
+  > *"Paciente de nuestra cohorte con diabetes, hipertensión y fibrilación auricular ≥75 años. ¿Qué evidencia existe sobre anticoagulantes orales directos (DOAC) frente a warfarina para prevención de ictus?"*
+- **Protección Renal e Insuficiencia Cardíaca:** 
+  > *"Diabetes y enfermedad renal crónica en la cohorte local: ¿cuál es la evidencia de uso de iSGLT2 en desenlaces renales y cardiovasculares prospectivos?"*
+- **Seguridad y Efectos Adversos:** 
+  > *"En pacientes diabéticos de nuestra cohorte, ¿qué evidencia de alta calidad existe sobre la seguridad clínica de semaglutide respecto a episodios de hipoglucemia?"*
+- **Intersección Híbrida Explícita (SQL + Literatura):** 
+  > *"Usando los pacientes de nuestra base de datos biomédica local y la bibliografía externa actual, ¿qué opciones terapéuticas tienen mejor evidencia para reducir MACE en diabetes tipo 2 con hipertensión?"*
+
+---
+
+## 🏗️ Arquitectura del Flujo (Epistemic RAG)
+
+El pipeline opera como un embudo de precisión rigurosa:
+
+```text
+Patient Context (SQL/FHIR) & Free-text Query
+       ↓
+Clinical Intent Extraction (PICO & Desired Outcomes)
+       ↓
+Adaptive PubMed Retrieval (High-Recall Stage)
+       ↓
+Semantic Cross-Encoder Reranking 
+       ↓
+Epistemic Hierarchy Modeling (RCTs > Preclinical)
+       ↓
+Demographic Applicability Adjustment
+       ↓
+Hallucination-Constrained Synthesis
+```
+
+---
+
+## 🔬 Epistemic & Applicability Scoring Math
+
+El ranking final no es un simple producto del LLM o modelo semántico. Inyecta reglas clínicas en cada cálculo:
+
+| Tipo de Evidencia | Epistemic Multiplier |
+|-------------------|----------------------|
+| Meta-Analysis / Guideline / RCT | `1.0 + 0.15 boost` |
+| Observational / Target Trial | `1.0` |
+| Case Report | `0.45` |
+| Mechanistic / Pathophysiology | `0.25` |
+| Preclinical / Animal model | `0.25` |
+
+El núcleo matemático del reranker sigue esta constante:
+```python
+final_score = (semantic_score) * applicability_score * epistemic_multiplier * noise_suppression
+```
+
+**Applicability Scoring:**
+El pipeline penaliza automáticamente evidencia desconectada del perfil clínico del paciente. Por ejemplo:
+- Estudios de cohorte obstétrica/embarazo ante un paciente no gestacional (`× 0.7`).
+- Papers de pediatría (`adolescents`, `neonatal`) arrastrados accidentalmente para cohortes locales estructuradas sobre pacientes `≥ 65` años (`× 0.5`).
+
+---
+
+## 🔌 Empezar (Quickstart)
+
+Requiere **Python 3.11+**. Soporta APIs compatibles con OpenAI o inferencia local (ej. `llama.cpp` + `Llama-3-8b`).
 
 ```bash
+# Entorno
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r requirements-semantic.txt
+
+# Config (Rellenar LLM_BASE_URL, keys y perfil)
+cp .env.example .env
+
+# Arrancar la API local
 python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
-
-| Ruta | Descripción |
-|------|-------------|
-| `POST /query` | Cuerpo: `{ "query": "...", "session_id": "opcional" }`. Respuesta: ruta, `pubmed_query` (planner LLM), `clinical_intent`, `final_answer`, `trace`, `pmids`, `citations`, `retrieval_debug` (p. ej. `multi_stage_queries`), etc. |
-| `GET /health` | Estado + config no sensible (`copilot_query_planner`, `copilot_evidence_backend`, host LLM, API key, BD clínica resuelta). |
-| `GET /` | Enlaces a docs y health |
-| `GET /docs` | Swagger UI |
-
-En Swagger, la pestaña **Example value** del código 200 muestra placeholders típicos del schema; los datos reales aparecen tras **Execute** en *Try it out*.
+Swagger UI disponible en `http://127.0.0.1:8000/docs`.
 
 ---
 
-## Variables de entorno
+## ⚖️ Limitaciones y Honestidad Metodológica
 
-Copiar `.env.example` → `.env` y revisar al menos:
-
-| Variable | Rol |
-|----------|-----|
-| `COPILOT_EVIDENCE_BACKEND` | `ncbi` (default), `stub`, `epmc`, `multi` |
-| `COPILOT_QUERY_PLANNER` | Legacy en `.env` / `GET /health` (default `heuristic`). Retrieval = heurística multi-etapa; no depende del LLM salvo refinamiento opcional. |
-| `COPILOT_PUBMED_LLM_REFINE` | `1` / `true`: añade etapa `llm_refine` extra tras el plan heurístico (requiere `LLM_BASE_URL` + `LLM_MODEL`). Off por defecto. |
-| `COPILOT_LLM_PROFILE` | `custom` (default), `openai`, `llamacpp`, `off` — ver `.env.example` y `app/config/llm_env.py`. |
-| `COPILOT_SYNTHESIS` | `deterministic` (default): `final_answer` = render de `MedicalAnswer` por reglas. `llm`: `final_answer` = solo narrativa LLM (JSON de hechos + interpretación por PMID; sin pegar el borrador determinista); `medical_answer` sigue siendo estructurado. Si el LLM falla, fallback al render determinista. Opcionales: `COPILOT_SYNTHESIS_MAX_TOKENS` (default **1536**), `COPILOT_SYNTHESIS_TIMEOUT` (default **120** s, máx. 600), `COPILOT_SYNTHESIS_TEMPERATURE`. |
-| `COPILOT_SEMANTIC_RERANK` | `off` (default). `embeddings` \| `cross_encoder` \| `full`: rerank con `sentence-transformers` (ver `requirements-semantic.txt`). Modelos: `COPILOT_EMBEDDING_MODEL`, `COPILOT_RERANKER_MODEL`. |
-| `LLM_BASE_URL`, `LLM_MODEL`, `OPENAI_API_KEY` | Necesarios si `COPILOT_PUBMED_LLM_REFINE=1` o `COPILOT_SYNTHESIS=llm` (p. ej. `https://api.openai.com/v1` o `http://127.0.0.1:8080/v1`). |
-| `NCBI_EMAIL` | Recomendado para cuotas E-utilities |
-| `COPILOT_EVAL_LOG_PATH` | Opcional; log JSONL de evaluación |
-| `CLINICAL_DB_PATH` | Ruta al SQLite de datos clínicos (p. ej. `data/clinical/synthea.db` tras tu ETL). Usado por `SqliteClinicalCapability`. **Rutas relativas** se resuelven desde la **raíz del repo** (no desde el directorio de trabajo de uvicorn). |
-
-Al arrancar, `app/main.py` carga `.env` y fuerza desde fichero las claves del planner/LLM para evitar que variables del sistema las pisen.
+- **No es un dispositivo médico**: Proyecto puramente de *research engineering* / portafolio.
+- **Heurísticas léxicas**: El scoring de aplicabilidad poblacional está fundamentado actualmente en reglas de matching léxico robustas, pero no constituye una red neuronal clínica supervisada (Clinical NER).
+- **No hay validación formal**: Carece de un dataset de *gold standards* (evaluación sistémica) puntuado por un tribunal médico para métricas tipo nDCG.
+- **Safety over Creativity**: La síntesis usa guardarraíles fuertes que cortan o bloquean texto, pero no reemplaza, ni por asomo, la inferencia médica humana.
 
 ---
 
-## Datos Synthea y SQLite (capability A)
+## 🔭 Research Directions (Roadmap)
 
-1. Clonar y ejecutar Synthea (Java 17+). En Windows usa `.\gradlew.bat run -Params="['-p','100']"` en lugar de `./run_synthea`.
-2. Con CSV activados, importar a SQLite: `python scripts/synthea_csv_to_sqlite.py` (ver `docs/SYNTHEA.md`).
-3. Apunta `CLINICAL_DB_PATH` en `.env` a ese fichero.
-4. Detalle paso a paso: **[`docs/SYNTHEA.md`](docs/SYNTHEA.md)**.
-
----
-
-## Instalación rápida
-
-```bash
-python -m venv .venv
-.venv\Scripts\Activate.ps1     # Windows
-# source .venv/bin/activate    # Linux / macOS
-
-pip install -r requirements.txt
-copy .env.example .env         # Rellenar según tabla anterior
-```
-
-## Tests
-
-```bash
-pytest tests/ -q
-```
-
-Incluye grafo, API, PubMed (parser/integration opcional con `RUN_NCBI_INTEGRATION`), planificadores de query, etc.
-
----
-
-## Principios de diseño
-
-**Evitar:** monolitos con dumps de BD; inventar PMIDs; subir `.env` con secretos.
-
-**Priorizar:** routing determinista; límites en DTOs (`copilot_state`); **separación retrieval (recall) vs rerank (precisión clínica)**; trazas auditables; errores con `error_code` (sin sustituir silenciosamente LLM ni PubMed).
-
----
-
-## Estado y roadmap
-
-### Hecho (≈ v0.3–v0.4)
-
-- Grafo LangGraph: router determinista, evidencia inyectable, trazas (`trace`)
-- `POST /query`, `GET /health`, caché de grafo (evidencia + planner + BD clínica)
-- PubMed (NCBI), Europe PMC, multi-fuente, stub; **recuperación heurística multi-etapa** + `pubmed_query` canónica auditada; LLM PubMed solo con `COPILOT_PUBMED_LLM_REFINE`
-- **`ClinicalIntent`** + **`clinical_alignment`** (rerank por PICO; `priority_axis`; outcome gradual; comparador)
-- **`evidence_dedup`**: deduplicación de PMIDs/citas antes de síntesis
-- `MedicalAnswer` determinista + síntesis narrativa opcional (`COPILOT_SYNTHESIS=llm`)
-- `SqliteClinicalCapability` + ETL CSV→SQLite + ruta SQL con **NL heurístico → SQL seguro** (`cohort_nl.py`)
-- Log de evaluación JSONL opcional
-- Tests: `test_clinical_intent_alignment`, `test_pubmed_retrieval_broad`, `test_evidence_dedup`
-
-### Próximos pasos (cohorte SQL y analizador)
-
-Inspiración parcial en el proyecto hermano `sina_mcp/sqlite-analyzer` (p. ej. introspección de esquema y agente SQL en `FHire.py`), manteniendo aquí **SQL solo vía plantillas / builder** y `run_safe_query`, sin texto SQL arbitrario del modelo.
-
-| Ahora | Siguiente |
-|--------|-----------|
-| Heurística fija + sinónimos | **LLM o NER clínico** que rellene un `CohortNLSpec` (o JSON schema) con límites y validación |
-| Solo `COUNT(DISTINCT id)` | **`SELECT` con agregados / desglose**, siempre plantillas + validación |
-| Agente SQL abierto tipo `FHire.py` | Reutilizar ideas de **schema tool**, sin dejar al modelo escribir SQL arbitrario sin pasar por un **builder blanco** |
-
-### Más adelante
-
-- UI / evaluación sistemática (gold sets de ranking)
-- Boost guías (ADA/ESC/EASD) moderado en rerank; detección de tensiones entre PMIDs
-- Outcome/comparator con más cobertura semántica (embeddings) si la heurística lexical no basta
-- Enriquecer cohorte (fechas Synthea, códigos, tablas adicionales del export)
+- Clinical NER fundamentado directamente sobre *ontology embeddings*.
+- Modelado de peso para inferencia epidemiológica causal (Causal Evidence Weighting).
+- Extracción e ingestión estructurada de guías médicas de la ADA/ESC.
+- Razonamiento sobre cohortes (Agentic SQL Constrained Execution).
+- Modelado longitudinal de la trayectoria del paciente basado en perfiles complejos.

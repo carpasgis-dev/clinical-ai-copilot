@@ -189,7 +189,27 @@ def build_reasoning_state(state: dict[str, Any]) -> ReasoningState:
             "de inclusión del estudio (puede ser más amplia que la cohorte SQL)."
         )
 
-    for i, a in enumerate(arts[:6]):
+    scored_arts: list[tuple[float, dict[str, Any]]] = []
+    for a in arts:
+        if not isinstance(a, dict):
+            continue
+        fr = a.get("final_rank_score")
+        if fr is not None:
+            score = float(fr)
+        else:
+            dbg = a.get("rank_score_debug")
+            if isinstance(dbg, dict) and dbg.get("final_fusion") is not None:
+                score = float(dbg["final_fusion"])
+            else:
+                sem = a.get("semantic_scores")
+                if isinstance(sem, dict) and sem.get("fused") is not None:
+                    score = float(sem["fused"])
+                else:
+                    score = 0.35
+        scored_arts.append((score, a))
+    scored_arts.sort(key=lambda x: x[0], reverse=True)
+
+    for score, a in scored_arts[:6]:
         pmid = str(a.get("pmid") or "").strip()
         title = str(a.get("title") or "")
         year = a.get("year")
@@ -199,15 +219,7 @@ def build_reasoning_state(state: dict[str, Any]) -> ReasoningState:
         elif year is not None and str(year).strip().isdigit():
             y_int = int(str(year)[:4])
 
-        sem = a.get("semantic_scores")
-        if isinstance(sem, dict) and sem.get("fused") is not None:
-            score = float(sem["fused"])
-        else:
-            score = max(0.35, 1.0 - (i * 0.08))
-            if y_int is not None and y_int >= 2020:
-                score = min(1.0, score + 0.05)
         score = round(score, 3)
-
         study = infer_study_type_from_title(title)
 
         appl = infer_applicability_line(
@@ -280,6 +292,7 @@ def build_reasoning_state(state: dict[str, Any]) -> ReasoningState:
     if cal is not None:
         cal_line = (
             f"Calibración síntesis: confianza recuperación={cal.retrieval_confidence:.2f}, "
+            f"utilidad respuesta={cal.clinical_answer_confidence:.2f}, "
             f"tier dominante={cal.dominant_retrieval_tier}, outcome={cal.retrieval_outcome}."
         )
         if cal_line not in notes:

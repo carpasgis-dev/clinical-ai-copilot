@@ -190,6 +190,15 @@ def pubmed_clause_cv_moderate() -> str:
     return _pubmed_or_from_components((*MACE_COMPONENTS[:1], _CV_MODERATE))
 
 
+def pubmed_clause_cv_primary() -> str:
+    """
+    T1 (broad_primary): MACE + CVOT sin «heart disease» / «cardiovascular disease» genéricos.
+
+    Reduce ``result_count`` en PubMed (objetivo ~5k–15k vs decenas de miles).
+    """
+    return _pubmed_or_from_components((*MACE_COMPONENTS, _CVOT))
+
+
 def pubmed_clause_for_theme(theme: OutcomeTheme, *, tier: str) -> str | None:
     if tier == "broad":
         return None

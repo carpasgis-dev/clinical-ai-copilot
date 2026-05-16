@@ -117,6 +117,8 @@ class MultiSourceEvidenceCapability:
         pubmed_query: str,
         retmax: int = 6,
         years_back: int = 5,
+        *,
+        synthesis_pubtype_refine: bool = True,
     ) -> EvidenceBundle:
         term = (pubmed_query or "").strip()
         if not term:
@@ -134,13 +136,19 @@ class MultiSourceEvidenceCapability:
                     term,
                     retmax=cap,
                     years_back=years_back,
+                    synthesis_pubtype_refine=synthesis_pubtype_refine,
                 )
                 for src in self._sources
             ]
             bundles = gather_sync_calls_blocking(calls, limit=len(self._sources))
         else:
             bundles = [
-                src.retrieve_evidence(term, retmax=cap, years_back=years_back)
+                src.retrieve_evidence(
+                    term,
+                    retmax=cap,
+                    years_back=years_back,
+                    synthesis_pubtype_refine=synthesis_pubtype_refine,
+                )
                 for src in self._sources
             ]
 

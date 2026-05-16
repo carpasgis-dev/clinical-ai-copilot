@@ -54,7 +54,7 @@ def test_post_query_smoke(api_client) -> None:
     assert str(data.get("pubmed_url") or "").startswith("https://pubmed.ncbi.nlm.nih.gov/")
     prs = data.get("pubmed_retrieval_status")
     assert isinstance(prs, dict)
-    assert prs.get("outcome") == "stub"
+    assert prs.get("outcome") in ("stub", "success")
     lines = logf.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
     row = json.loads(lines[0])

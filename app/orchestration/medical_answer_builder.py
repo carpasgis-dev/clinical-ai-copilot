@@ -127,44 +127,65 @@ def _build_synthesis_orientation(
     ctx = _clinical_ctx(state)
 
     def _headline_arts(a_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        amin = ctx.population_age_min if ctx else None
-        conds = list(ctx.population_conditions) if ctx and ctx.population_conditions else None
-        meds = list(ctx.population_medications) if ctx and ctx.population_medications else None
-        good: list[dict[str, Any]] = []
-        bad: list[dict[str, Any]] = []
-        for a in a_list:
-            tit = str(a.get("title") or "").strip()
-            line = infer_applicability_line(
-                tit,
-                population_age_min=amin,
-                population_conditions=conds,
-                population_medications=meds,
-                user_query=user_query,
-                abstract_snippet=str(a.get("abstract_snippet") or ""),
+        from app.capabilities.evidence_rag.clinical_answerability import (
+            eligible_for_featured_headline,
+        )
+        from app.capabilities.evidence_rag.clinical_intent import ClinicalIntent
+
+        intent_raw = state.get("clinical_intent")
+        intent = None
+        if isinstance(intent_raw, ClinicalIntent):
+            intent = intent_raw
+        elif isinstance(intent_raw, dict):
+            intent = ClinicalIntent.from_dict(intent_raw)
+        pool_strong = any(
+            infer_study_type_from_title(str(x.get("title") or ""))
+            in (
+                "cvot-outcomes-trial",
+                "rct",
+                "meta-analysis",
+                "network-meta-analysis",
+                "systematic-review",
             )
-            if line and line.startswith("Limitada"):
-                bad.append(a)
-            else:
-                good.append(a)
+            for x in a_list
+        )
 
         def _rank_score(a: dict[str, Any]) -> float:
-            align = a.get("alignment_scores")
-            if isinstance(align, dict) and align:
-                pop = float(align.get("population_score") or 0)
-                iv = float(align.get("intervention_score") or 0)
-                out = float(align.get("outcome_score") or 0)
-                return 0.4 * pop + 0.35 * iv + 0.25 * out
+            fr = a.get("final_rank_score")
+            if fr is not None:
+                return float(fr)
+            dbg = a.get("rank_score_debug")
+            if isinstance(dbg, dict) and dbg.get("final_fusion") is not None:
+                return float(dbg["final_fusion"])
+            sem = a.get("semantic_scores")
+            if isinstance(sem, dict) and sem.get("fused") is not None:
+                return float(sem["fused"])
             return lexical_relevance_score(
                 user_query,
                 str(a.get("title") or ""),
                 str(a.get("abstract_snippet") or ""),
             )
 
-        good_ranked = [a for a in good if _rank_score(a) >= MIN_HEADLINE_LEXICAL_RELEVANCE]
-        good_rest = [a for a in good if _rank_score(a) < MIN_HEADLINE_LEXICAL_RELEVANCE]
-        good_sorted = sorted(good_ranked, key=_rank_score, reverse=True) + good_rest
-        merged = good_sorted + bad
-        return merged[:2] if merged else a_list[:2]
+        candidates: list[dict[str, Any]] = []
+        for a in a_list:
+            tit = str(a.get("title") or "").strip()
+            snip = str(a.get("abstract_snippet") or "")
+            st = infer_study_type_from_title(tit)
+            if not eligible_for_featured_headline(
+                st,
+                tit,
+                snip,
+                pool_has_strong_answerable=pool_strong,
+                intent=intent,
+            ):
+                continue
+            candidates.append(a)
+
+        if not candidates:
+            candidates = list(a_list)
+
+        ranked = sorted(candidates, key=_rank_score, reverse=True)
+        return ranked[:2]
 
     parts: list[str] = []
     labels: list[str] = []
@@ -322,6 +343,14 @@ def build_stub_medical_answer(state: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(eb, dict):
         raw_arts = eb.get("articles") or []
         arts = [a for a in raw_arts if isinstance(a, dict)]
+        arts.sort(
+            key=lambda a: float(
+                a.get("final_rank_score")
+                or (a.get("rank_score_debug") or {}).get("final_fusion")
+                or 0.0
+            ),
+            reverse=True,
+        )
 
     uq_full = (state.get("user_query") or "").strip()
 
@@ -335,20 +364,39 @@ def build_stub_medical_answer(state: Dict[str, Any]) -> Dict[str, Any]:
                 "tipo de publicación (revisión, meta-análisis o ensayo controlado aleatorizado)."
             )
 
+    clinical_claim_bundle: dict[str, Any] | None = None
+    clinical_claims_summary: str | None = None
+    claim_bundle_obj = None
+    if arts and route in (Route.HYBRID, Route.EVIDENCE):
+        from app.capabilities.evidence_rag.claim_extraction import (
+            extract_claims_from_state,
+            render_claim_bundle_markdown,
+        )
+
+        claim_bundle_obj = extract_claims_from_state(state)
+        if claim_bundle_obj.claims:
+            clinical_claim_bundle = claim_bundle_obj.to_dict()
+            clinical_claims_summary = render_claim_bundle_markdown(claim_bundle_obj)
+
     evidence_statements: List[Dict[str, Any]] = []
-    for a in arts[:6]:
-        pmid = str(a.get("pmid") or "").strip()
-        title = str(a.get("title") or "").strip()
-        if not pmid:
-            continue
-        design = infer_study_type_from_title(title)
-        st_body = _evidence_statement_from_article(a)
-        st = (f"[Diseño inferido del título: {design}] " if design else "") + st_body
-        row: Dict[str, Any] = {"statement": st, "citation_pmids": [pmid]}
-        strength = _infer_evidence_strength(title)
-        if strength is not None:
-            row["strength"] = strength.value
-        evidence_statements.append(row)
+    if claim_bundle_obj and claim_bundle_obj.claims:
+        from app.capabilities.evidence_rag.claim_extraction import claims_to_evidence_statements
+
+        evidence_statements = claims_to_evidence_statements(claim_bundle_obj)
+    else:
+        for a in arts[:6]:
+            pmid = str(a.get("pmid") or "").strip()
+            title = str(a.get("title") or "").strip()
+            if not pmid:
+                continue
+            design = infer_study_type_from_title(title)
+            st_body = _evidence_statement_from_article(a)
+            st = (f"[Diseño inferido del título: {design}] " if design else "") + st_body
+            row: Dict[str, Any] = {"statement": st, "citation_pmids": [pmid]}
+            strength = _infer_evidence_strength(title)
+            if strength is not None:
+                row["strength"] = strength.value
+            evidence_statements.append(row)
 
     if arts:
         n = len(arts)
@@ -401,6 +449,14 @@ def build_stub_medical_answer(state: Dict[str, Any]) -> Dict[str, Any]:
             f"Literatura: {len(arts)} artículo(s) recuperado(s) para apoyar la consulta de evidencia."
         )
 
+    aggregated_findings: str | None = None
+    if arts and route in (Route.HYBRID, Route.EVIDENCE):
+        from app.capabilities.evidence_rag.evidence_aggregation import (
+            aggregate_therapeutic_findings_from_state,
+        )
+
+        aggregated_findings = aggregate_therapeutic_findings_from_state(state)
+
     ori = _build_synthesis_orientation(state, arts, uq_full)
     if ori:
         key_findings.insert(0, ori)
@@ -437,7 +493,9 @@ def build_stub_medical_answer(state: Dict[str, Any]) -> Dict[str, Any]:
         elif sql_r:
             local_cohort_block = _cohort_summary_sql_only(sql_r, cohort_n)
 
-    external_evidence_block: str | None = evidence_summary
+    external_evidence_block: str | None = (
+        clinical_claims_summary if clinical_claims_summary else evidence_summary
+    )
 
     summary_parts: list[str] = []
     if route == Route.HYBRID and arts:
@@ -475,6 +533,10 @@ def build_stub_medical_answer(state: Dict[str, Any]) -> Dict[str, Any]:
         "limitations": _base_limitations(),
         "citations": cites_json,
         "evidence_statements": evidence_statements,
+        "aggregated_findings": aggregated_findings,
+        "clinical_claim_bundle": clinical_claim_bundle,
+        "clinical_claims_summary": clinical_claims_summary,
+        "sintesis_modo": "claim_first" if clinical_claim_bundle else "paper_centric",
         "uncertainty_notes": [],
         "applicability_notes": [],
     }
@@ -520,11 +582,17 @@ def render_medical_answer_to_text(answer: Dict[str, Any]) -> str:
         blocks.append("## Evidencia PubMed\n" + eeb.strip())
     elif (es := answer.get("evidence_summary")) and isinstance(es, str) and es.strip():
         blocks.append("## Evidencia PubMed\n" + es.strip())
+    ccs = answer.get("clinical_claims_summary")
+    if isinstance(ccs, str) and ccs.strip():
+        blocks.append(ccs.strip())
+    agg = answer.get("aggregated_findings")
+    if isinstance(agg, str) and agg.strip():
+        blocks.append(agg.strip())
     kf = answer.get("key_findings") or []
     if isinstance(kf, list) and kf:
         lines = "\n".join(f"• {str(x).strip()}" for x in kf if str(x).strip())
         if lines:
-            blocks.append("Hallazgos clave\n" + lines)
+            blocks.append("Otros hallazgos y notas\n" + lines)
     rec = answer.get("recommendations") or []
     if isinstance(rec, list) and rec:
         lines = "\n".join(f"• {str(x).strip()}" for x in rec if str(x).strip())

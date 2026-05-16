@@ -251,6 +251,12 @@ class CopilotState(TypedDict, total=False):
     clinical_intent: dict[str, Any]
     """Intención clínica PICO-lite (``ClinicalIntent``) extraída para re-ranking y síntesis."""
 
+    clinical_intent_graph: dict[str, Any]
+    """Stage 1: grafo clínico (question_type, PICO, política de evidencia, landmarks esperados)."""
+
+    clinical_evidence_frame: dict[str, Any]
+    """Marco semántico canónico (``ClinicalEvidenceFrame``) — SSOT para policy/rerank/claims."""
+
     synthesis_calibration: dict[str, Any]
     """Calibración epistémica post-retrieval (``SynthesisCalibration.to_dict()``)."""
 

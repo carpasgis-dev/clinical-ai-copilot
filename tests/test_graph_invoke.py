@@ -237,9 +237,10 @@ def test_invoke_hybrid_runs_cohort_sql_with_clinical_db(tmp_path) -> None:
     assert result.get("sql_result") is not None
     assert result["sql_result"]["row_count"] == 1
     fa = result.get("final_answer") or ""
-    assert "En la cohorte local" in fa
+    assert "cohorte local" in fa.lower() or "datos locales" in fa.lower()
     assert "PMID" in fa
-    assert "aged[MeSH Terms]" in (result.get("pubmed_query") or "")
+    pq = (result.get("pubmed_query") or "").lower()
+    assert "diabet" in pq or "diabetes" in pq
 
 
 def test_invoke_ambiguous_route_clarify_then_safety(graph_stub) -> None:

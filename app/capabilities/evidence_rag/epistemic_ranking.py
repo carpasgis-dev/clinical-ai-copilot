@@ -53,6 +53,8 @@ def infer_epistemic_profile(title: str, abstract: str, intent: ClinicalIntent | 
         multiplier = 0.45
     elif detected in ("rct", "meta_analysis", "guideline", "target_trial"):
         boost = 0.15
+    elif detected == "review":
+        multiplier = 0.55
 
     # If the user is specifically asking for outcomes/treatment
     if intent and (intent.outcomes or intent_asks_cv_outcomes(intent)):
@@ -60,6 +62,8 @@ def infer_epistemic_profile(title: str, abstract: str, intent: ClinicalIntent | 
             multiplier = 0.15 # even heavier penalty for outcomes
         elif detected in ("rct", "meta_analysis", "guideline"):
             boost = 0.30 # heavy boost for outcomes
+        elif detected == "review":
+            multiplier = 0.32
 
     return EpistemicProfile(
         evidence_type=detected,

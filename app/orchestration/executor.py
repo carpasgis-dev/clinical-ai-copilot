@@ -11,7 +11,11 @@ from typing import Any
 
 from app.capabilities.contracts import ClinicalCapability, EvidenceCapability
 from app.capabilities.evidence_rag.copilot_errors import CopilotError
-from app.capabilities.evidence_rag.clinical_intent import extract_clinical_intent
+from app.capabilities.evidence_rag.clinical_intent_graph import (
+    build_clinical_intent_graph,
+    landmarks_found_in_articles,
+)
+from app.capabilities.evidence_rag.clinical_semantics import build_clinical_evidence_frame
 from app.capabilities.evidence_rag.evidence_pool_filter import filter_off_topic_abstracts
 from app.capabilities.evidence_rag.evidence_rerank import (
     clinical_weak_evidence_share,
@@ -22,6 +26,7 @@ from app.capabilities.evidence_rag.heuristic_evidence_query import (
     as_clinical_context,
     build_evidence_retrieval_stages,
     build_evidence_search_queries,
+    build_landmark_rescue_query_for_graph,
     canonical_pubmed_query_after_retrieval,
     preview_pubmed_query,
 )
@@ -378,6 +383,8 @@ def _step_evidence_retrieve(
     warn: list[str] = []
 
     ctx_raw = work.get("clinical_context")
+    intent_graph = build_clinical_intent_graph(uq, ctx_raw)
+    evidence_frame = build_clinical_evidence_frame(uq, ctx_raw)
     retrieval_stages: list[RetrievalStage] = build_evidence_retrieval_stages(uq, ctx_raw)
     adaptive = bool(
         retrieval_stages
@@ -459,6 +466,36 @@ def _step_evidence_retrieve(
         warn=warn,
     )
 
+    expected_lm = evidence_frame.expected_landmark_trials or intent_graph.expected_landmark_trials
+    found_lm = landmarks_found_in_articles(
+        [a for a in merged_arts if isinstance(a, dict)],
+        expected_lm,
+    )
+    if expected_lm and len(found_lm) < max(1, len(expected_lm) // 3):
+        rescue_q = build_landmark_rescue_query_for_graph(intent_graph).strip()
+        if rescue_q and rescue_q not in queries:
+            rescue_stage = RetrievalStage(
+                stage_id="landmark_rescue",
+                query=rescue_q,
+                years_back_override=20,
+                stage_role="supplemental",
+                retrieval_tier=2,
+            )
+            _run_retrieval_stage(
+                rescue_stage,
+                evidence=evidence,
+                years_back=years_back,
+                pool_max=pool_max,
+                merged_arts=merged_arts,
+                seen_pm=seen_pm,
+                queries=queries,
+                stages_executed=stages_executed,
+                primary_bundle_holder=primary_holder,
+            )
+            warn.append(
+                "evidence: rescate landmark activado (landmarks esperados ausentes en pool inicial)."
+            )
+
     primary_bundle = primary_holder[0]
 
     if not merged_arts:
@@ -503,12 +540,15 @@ def _step_evidence_retrieve(
     if isinstance(raw_arts, list) and raw_arts:
         uq = _graph_effective_user_query(work)
         amin, pconds, pmeds = _cohort_rerank_hints(work)
-        intent = extract_clinical_intent(uq, work.get("clinical_context"))
+        intent = evidence_frame.to_clinical_intent()
         clinical_intent_dict = intent.to_dict()
         clinical_ctx = as_clinical_context(work.get("clinical_context"))
-        
-        # Filtro de purificación PRE-Rerank: quitamos basura ontológica obvia
-        clean_arts = filter_off_topic_abstracts([a for a in raw_arts if isinstance(a, dict)], intent)
+
+        clean_arts = filter_off_topic_abstracts(
+            [a for a in raw_arts if isinstance(a, dict)],
+            intent,
+            intent_graph=intent_graph,
+        )
         raw_arts_filtered_count = len(raw_arts) - len(clean_arts)
         if raw_arts_filtered_count > 0:
             warn.append(f"evidence: filtro pre-rerank excluyó {raw_arts_filtered_count} artículos no relacionados al dominio clínico central.")
@@ -573,6 +613,8 @@ def _step_evidence_retrieve(
         )
     if clinical_intent_dict is not None:
         out["clinical_intent"] = clinical_intent_dict
+    out["clinical_intent_graph"] = intent_graph.to_dict()
+    out["clinical_evidence_frame"] = evidence_frame.to_dict()
     return out
 
 

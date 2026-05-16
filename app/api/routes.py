@@ -12,7 +12,8 @@ from app.api.evidence_factory import resolve_evidence_backend
 from app.api.graph_cache import get_compiled_graph
 from app.capabilities.evidence_rag.copilot_errors import CopilotError
 from app.capabilities.evidence_rag.query_planning import query_planner_cache_token
-from app.api.response_format import build_query_response, citations_from_state
+from app.api.response_format import build_query_response
+from app.orchestration.medical_answer_builder import citations_from_state
 from app.api.schemas import HERO_QUERY_EXAMPLE, Http422Response, QueryRequest, QueryResponse
 from app.eval.run_logger import log_eval_event
 

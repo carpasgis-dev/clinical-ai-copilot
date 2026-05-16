@@ -26,6 +26,7 @@ _NEGATIVE_TOPIC_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\beditorial\b", re.I), "editorial"),
     (re.compile(r"\bletter\s+to\s+the\s+editor\b", re.I), "letter"),
     (re.compile(r"\bcommentary\b", re.I), "commentary"),
+    (re.compile(r"\bpregnan", re.I), "pregnancy"),
 )
 
 # Eje traslacional: un solo hit ya aplica el suelo (no acumular por len(topics) >= 2).

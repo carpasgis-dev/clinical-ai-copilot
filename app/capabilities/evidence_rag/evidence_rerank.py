@@ -34,7 +34,6 @@ from app.capabilities.evidence_rag.semantic_config import semantic_rerank_mode
 from app.capabilities.evidence_rag.applicability_scoring import calculate_applicability
 from app.capabilities.evidence_rag.epistemic_ranking import finalize_rank_score
 from app.capabilities.evidence_rag.retrieval_tiers import tier_weight_multiplier
-from app.capabilities.evidence_rag.semantic_ranking import semantic_rank_articles
 
 _STOP = frozenset(
     {
@@ -175,11 +174,35 @@ _CV_OUTCOME_DESIGN_WEIGHTS: dict[str, float] = {
     "umbrella-review": 0.78,
     "review": 0.55,
     "mechanistic-review": 0.55,
-    "narrative-review": 0.45,
+    "narrative-review": 0.28,
+    "review": 0.38,
     "cohort": 0.48,
     "epidemiology": 0.42,
     "cross-sectional": 0.38,
 }
+
+_STRONG_CV_DESIGNS = frozenset(
+    {
+        "cvot-outcomes-trial",
+        "rct",
+        "meta-analysis",
+        "network-meta-analysis",
+        "systematic-review",
+        "umbrella-review",
+    }
+)
+_WEAK_TOPK_DESIGNS = frozenset(
+    {
+        "narrative-review",
+        "mechanistic-review",
+        "review",
+        "cross-sectional",
+        "epidemiology",
+        "editorial",
+        "basic-research",
+        "preclinical",
+    }
+)
 
 
 def study_design_weight(
@@ -510,6 +533,7 @@ def composite_relevance_score(
     )
     recency = max(0.0, 0.06 - position_index * 0.01)
     cv_ask = clinical_intent is not None and intent_asks_cv_outcomes(clinical_intent)
+    st = infer_study_type_from_title(title)
     tangential_pen = 0.0
     if cv_ask:
         blob = _fold(f"{title} {abstract_snippet}")
@@ -536,6 +560,14 @@ def composite_relevance_score(
     landmark = landmark_rerank_boost(
         title, abstract_snippet, clinical_intent=clinical_intent
     )
+    outcome_boost = 0.0
+    if cv_ask:
+        from app.capabilities.evidence_rag.outcome_ontology import graded_cv_outcome_score
+
+        o_score = graded_cv_outcome_score(_fold(f"{title} {abstract_snippet}"))
+        outcome_boost = 0.22 * o_score
+        if st in _WEAK_TOPK_DESIGNS and o_score < 0.35:
+            des *= 0.55
     raw = (
         0.30 * des
         + 0.28 * lex
@@ -545,12 +577,198 @@ def composite_relevance_score(
         + niche_pen
         + landmark
         + tangential_pen
+        + outcome_boost
         - penalty
     )
-    
+
     raw = max(0.01, raw * app_multiplier)
-    
-    return raw, app_line or "" 
+
+    return raw, app_line or ""
+
+
+def _article_base_rank_score(article: dict[str, Any]) -> float:
+    sem = article.get("semantic_scores")
+    if isinstance(sem, dict) and sem.get("fused") is not None:
+        return float(sem["fused"])
+    dbg = article.get("rank_score_debug")
+    if isinstance(dbg, dict) and dbg.get("fused") is not None:
+        return float(dbg["fused"])
+    return 0.01
+
+
+def _final_fusion_score(
+    article: dict[str, Any],
+    *,
+    clinical_intent: ClinicalIntent | None,
+    clinical_context: ClinicalContext | None,
+) -> float:
+    """
+    Score único para ordenar: semántica/heurística + diseño + tier + aplicabilidad + answerability.
+    """
+    from app.capabilities.evidence_rag.clinical_answerability import (
+        compute_answerability_breakdown,
+    )
+
+    base = _article_base_rank_score(article)
+    title = str(article.get("title") or "")
+    snip = str(article.get("abstract_snippet") or "")
+    blob = _fold(f"{title} {snip}")
+    st = infer_study_type_from_title(title)
+    qtype = getattr(clinical_intent, "question_type", None) if clinical_intent else None
+
+    epistemic = study_design_weight(st, clinical_intent=clinical_intent)
+    tier = tier_weight_multiplier(
+        int(article["retrieval_tier"])
+        if article.get("retrieval_tier") is not None
+        else None
+    )
+    app_mult = 1.0
+    if clinical_context is not None:
+        app_prof = calculate_applicability(title, snip, clinical_context)
+        app_mult = max(0.55, min(1.0, app_prof.applicability_score))
+
+    ans_bd = compute_answerability_breakdown(
+        st, title, snip, intent=clinical_intent, question_type=qtype
+    )
+    answerability = ans_bd.final_score
+
+    therapeutic_q = qtype in (
+        "treatment_efficacy",
+        "comparative_effectiveness",
+        "treatment_selection",
+    )
+    ans_weight = 0.24 if therapeutic_q else 0.10
+    base_weight = 0.32 if therapeutic_q else 0.40
+    if therapeutic_q and answerability < 0.38:
+        epistemic = min(epistemic, 0.18)
+        base = base * 0.55
+
+    outcome_add = 0.0
+    cv_ask = clinical_intent is not None and intent_asks_cv_outcomes(clinical_intent)
+    if cv_ask:
+        from app.capabilities.evidence_rag.outcome_ontology import graded_cv_outcome_score
+
+        o_graded = graded_cv_outcome_score(blob)
+        outcome_add = 0.15 * o_graded
+        if st in _WEAK_TOPK_DESIGNS and o_graded < 0.32:
+            epistemic *= 0.45
+
+    if answerability < 0.22:
+        epistemic = min(epistemic, 0.12)
+
+    fused = (
+        base_weight * base
+        + 0.25 * epistemic
+        + 0.15 * tier
+        + 0.08 * app_mult
+        + ans_weight * answerability
+        + outcome_add
+    )
+    return max(0.01, fused)
+
+
+def _rescore_articles_for_final_ranking(
+    articles: list[dict[str, Any]],
+    *,
+    clinical_intent: ClinicalIntent | None,
+    clinical_context: ClinicalContext | None,
+) -> list[dict[str, Any]]:
+    """Reordena el pool completo con la fusión tier + epistémica + outcome."""
+    scored: list[tuple[float, dict[str, Any]]] = []
+    from app.capabilities.evidence_rag.clinical_answerability import (
+        compute_answerability_breakdown,
+        evidence_role_label,
+    )
+
+    qtype = getattr(clinical_intent, "question_type", None) if clinical_intent else None
+
+    for a in articles:
+        final = _final_fusion_score(
+            a,
+            clinical_intent=clinical_intent,
+            clinical_context=clinical_context,
+        )
+        row = dict(a)
+        tit = str(row.get("title") or "")
+        snip = str(row.get("abstract_snippet") or "")
+        st = infer_study_type_from_title(tit)
+        ans_bd = compute_answerability_breakdown(
+            st, tit, snip, intent=clinical_intent, question_type=qtype
+        )
+        dbg = dict(row.get("rank_score_debug") or {})
+        dbg["final_fusion"] = round(final, 4)
+        dbg["answerability"] = ans_bd.to_dict()
+        row["rank_score_debug"] = dbg
+        row["final_rank_score"] = round(final, 4)
+        row["relevance_score"] = round(final, 4)
+        row["evidence_role"] = evidence_role_label(st, tit, snip)
+        scored.append((final, row))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [a for _, a in scored]
+
+
+def _demote_weak_evidence_in_topk(
+    ranked: list[dict[str, Any]],
+    pool: list[dict[str, Any]],
+    *,
+    cap: int,
+    clinical_intent: ClinicalIntent | None,
+) -> list[dict[str, Any]]:
+    """
+    Si hay CVOT/RCT/meta en el pool, saca preclínico/reviews débiles del top-3.
+    """
+    if not any(
+        infer_study_type_from_title(str(a.get("title") or "")) in _STRONG_CV_DESIGNS
+        for a in pool
+    ):
+        return ranked[:cap]
+
+    from app.capabilities.evidence_rag.clinical_answerability import clinical_answerability_score
+    from app.capabilities.evidence_rag.outcome_ontology import graded_cv_outcome_score
+
+    cv_mode = bool(
+        clinical_intent is not None and intent_asks_cv_outcomes(clinical_intent)
+    )
+
+    def _pool_score(a: dict[str, Any]) -> float:
+        return float(
+            a.get("final_rank_score")
+            or (a.get("rank_score_debug") or {}).get("final_fusion")
+            or 0.0
+        )
+
+    top = list(ranked[:cap])
+    top_pmids = {str(a.get("pmid") or "").strip() for a in top if str(a.get("pmid") or "").strip()}
+    tail = [a for a in pool if str(a.get("pmid") or "").strip() not in top_pmids]
+    tail.sort(key=_pool_score, reverse=True)
+    for i in range(min(3, len(top))):
+        art = top[i]
+        tit = str(art.get("title") or "")
+        snip = str(art.get("abstract_snippet") or "")
+        st = infer_study_type_from_title(tit)
+        if st not in _WEAK_TOPK_DESIGNS:
+            continue
+        blob = _fold(f"{tit} {snip}")
+        ans = clinical_answerability_score(st, tit, snip, intent=clinical_intent)
+        if st in ("basic-research", "preclinical"):
+            should_demote = True
+        elif cv_mode and graded_cv_outcome_score(blob) >= 0.38:
+            should_demote = False
+        elif ans >= 0.42:
+            should_demote = False
+        else:
+            should_demote = True
+        if not should_demote:
+            continue
+        for j, cand in enumerate(tail):
+            st_c = infer_study_type_from_title(str(cand.get("title") or ""))
+            tit_c = str(cand.get("title") or "")
+            snip_c = str(cand.get("abstract_snippet") or "")
+            cand_ans = clinical_answerability_score(st_c, tit_c, snip_c, intent=clinical_intent)
+            if st_c in _STRONG_CV_DESIGNS or cand_ans >= 0.55:
+                top[i], tail[j] = tail[j], top[i]
+                break
+    return top
 
 
 def _enforce_landmark_in_top_k(
@@ -632,6 +850,9 @@ def rerank_article_dicts(
         )
         if applicability_line:
             a["applicability_line"] = applicability_line
+        if clinical_context is not None:
+            app_prof = calculate_applicability(title, snip, clinical_context)
+            a["applicability_score"] = app_prof.applicability_score
         sc, rank_meta = finalize_rank_score(
             raw_sc,
             title=title,
@@ -652,18 +873,38 @@ def rerank_article_dicts(
         enriched.append(row)
 
     if semantic_rerank_mode() != "off":
-        out, sem_dbg = semantic_rank_articles(
+        from app.capabilities.evidence_rag.semantic_ranking import semantic_rank_articles
+
+        out_sem, sem_dbg = semantic_rank_articles(
             enriched,
             user_query=user_query,
             clinical_intent=clinical_intent,
             heuristic_scores=heuristic_scores,
-            cap=cap,
+            cap=min(len(enriched), max(cap * 3, cap)),
         )
-        for art in out:
-            art["semantic_ranking_debug"] = sem_dbg
-        return _enforce_landmark_in_top_k(out, enriched, cap=cap, clinical_intent=clinical_intent)
+        by_pmid = {
+            str(a.get("pmid") or "").strip(): a
+            for a in out_sem
+            if str(a.get("pmid") or "").strip()
+        }
+        for row in enriched:
+            pm = str(row.get("pmid") or "").strip()
+            if pm and pm in by_pmid:
+                sem = by_pmid[pm].get("semantic_scores")
+                if isinstance(sem, dict):
+                    row["semantic_scores"] = sem
+                row["semantic_ranking_debug"] = sem_dbg
 
-    pairs = list(zip(heuristic_scores, enriched))
-    pairs.sort(key=lambda x: x[0], reverse=True)
-    ordered = [a for _, a in pairs]
-    return _enforce_landmark_in_top_k(ordered, enriched, cap=cap, clinical_intent=clinical_intent)
+    ordered = _rescore_articles_for_final_ranking(
+        enriched,
+        clinical_intent=clinical_intent,
+        clinical_context=clinical_context,
+    )
+    top = _demote_weak_evidence_in_topk(
+        ordered,
+        enriched,
+        cap=cap,
+        clinical_intent=clinical_intent,
+    )
+    top = _enforce_landmark_in_top_k(top, enriched, cap=cap, clinical_intent=clinical_intent)
+    return top

@@ -16,19 +16,30 @@ from app.capabilities.evidence_rag.clinical_intent import (
     extract_clinical_intent,
     primary_outcome_theme,
 )
+from app.capabilities.evidence_rag.clinical_intent_graph import (
+    ClinicalIntentGraph,
+    build_clinical_intent_graph,
+)
 from app.capabilities.evidence_rag.clinical_knowledge import (
+    landmark_anticoag_retrieval_clause,
     landmark_cvot_retrieval_clause,
     landmark_pubmed_acronyms_clause,
 )
+from app.capabilities.evidence_rag.evidence_policy import pubmed_noise_exclusion_clause
 from app.capabilities.evidence_rag.mesh_lite import expand_cohort_token_for_pubmed
-from app.capabilities.evidence_rag.outcome_ontology import pubmed_clause_cv_moderate, pubmed_clause_for_theme
+from app.capabilities.evidence_rag.outcome_ontology import (
+    pubmed_clause_cv_moderate,
+    pubmed_clause_cv_primary,
+    pubmed_clause_cv_strict,
+    pubmed_clause_for_theme,
+)
 from app.capabilities.evidence_rag.policies import RETRIEVAL_POLICIES
 from app.capabilities.evidence_rag.retrieval_tiers import RetrievalTier
 from app.schemas.copilot_state import ClinicalContext
 
 _ELDERLY_CLAUSE = '("older adult"[tiab] OR elderly[tiab])'
 # Usamos las expansiones robustas (MeSH + tiab) en vez del hardcode tiab-only
-_CV_OUTCOME_COMPACT = f"({expand_cohort_token_for_pubmed('heart failure')} OR {expand_cohort_token_for_pubmed('ckd')} OR {expand_cohort_token_for_pubmed('fibrillation')} OR MACE[tiab] OR cardiovascular[tiab])"
+_CV_OUTCOME_COMPACT = f"({expand_cohort_token_for_pubmed('cardiac')} OR {expand_cohort_token_for_pubmed('ckd')} OR {expand_cohort_token_for_pubmed('fibrillat')} OR MACE[tiab] OR cardiovascular[tiab])"
 _INTERVENTION_COMPACT = f"({expand_cohort_token_for_pubmed('sglt2')} OR {expand_cohort_token_for_pubmed('glp1')})"
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +104,20 @@ def _intervention_blocks(intent: ClinicalIntent, *, compact: bool = False) -> li
         if phrase and phrase not in iv_blocks:
             iv_blocks.append(phrase)
     return iv_blocks
+
+
+def _primary_cv_outcome_clause() -> str:
+    """
+    Cláusula de desenlace CV para T1.
+
+    ``COPILOT_PRIMARY_CV_CLAUSE``: primary (default) | moderate | strict
+    """
+    mode = (os.getenv("COPILOT_PRIMARY_CV_CLAUSE") or "primary").strip().lower()
+    if mode in ("strict", "narrow"):
+        return pubmed_clause_cv_strict()
+    if mode in ("moderate", "broad"):
+        return pubmed_clause_cv_moderate()
+    return pubmed_clause_cv_primary()
 
 
 def _is_age_population_phrase(phrase: str) -> bool:
@@ -218,8 +243,7 @@ def build_broad_primary_query(
         blocks.append(iv_blocks[0] if len(iv_blocks) == 1 else f"({' OR '.join(iv_blocks)})")
 
     if theme == "cv":
-        # MACE/CV outcomes (moderate), no mezclar HF+renal+AFIB tan amplio en T1
-        blocks.append(pubmed_clause_cv_moderate())
+        blocks.append(_primary_cv_outcome_clause())
     elif policy.pubmed_broad_clause:
         blocks.append(policy.pubmed_broad_clause)
     else:
@@ -233,6 +257,149 @@ def build_broad_primary_query(
 def build_cvot_landmark_query(intent: ClinicalIntent) -> str:
     """Etapa T2: solo acrónimos de ensayos T2DM-CVOT (sin empagliflozin[tiab] ni AND SGLT2/GLP-1)."""
     return landmark_cvot_retrieval_clause()
+
+
+def _graph_iv_pubmed_blocks(graph: ClinicalIntentGraph) -> list[str]:
+    blocks: list[str] = []
+    for label in graph.intervention:
+        phrase = expand_cohort_token_for_pubmed(label)
+        if phrase and phrase not in blocks:
+            blocks.append(phrase)
+    return blocks
+
+
+def _graph_outcome_pubmed_block(graph: ClinicalIntentGraph) -> str:
+    parts: list[str] = []
+    for o in graph.outcomes:
+        phrase = expand_cohort_token_for_pubmed(o)
+        if phrase:
+            parts.append(phrase)
+    if not parts:
+        return (
+            '("stroke"[tiab] OR "systemic embolism"[tiab] OR "major bleeding"[tiab] '
+            'OR "intracranial hemorrhage"[tiab])'
+        )
+    return f"({' OR '.join(parts)})"
+
+
+def build_comparative_anticoag_primary_query(graph: ClinicalIntentGraph) -> str:
+    """T1 comparativa DOAC vs warfarina: población FA + intervención + desenlace + diseño."""
+    blocks: list[str] = []
+    if graph.population:
+        pop_phrases = [
+            expand_cohort_token_for_pubmed(p)
+            for p in graph.population[:2]
+            if expand_cohort_token_for_pubmed(p)
+        ]
+        if pop_phrases:
+            blocks.append(f"({' OR '.join(pop_phrases)})")
+
+    iv_blocks = _graph_iv_pubmed_blocks(graph)
+    if iv_blocks:
+        blocks.append(f"({' OR '.join(iv_blocks)})")
+
+    comp_blocks = [
+        expand_cohort_token_for_pubmed(c)
+        for c in graph.comparator
+        if expand_cohort_token_for_pubmed(c)
+    ]
+    if comp_blocks:
+        blocks.append(f"({' OR '.join(comp_blocks)})")
+
+    blocks.append(_graph_outcome_pubmed_block(graph))
+    blocks.append(
+        '("Randomized Controlled Trial"[pt] OR "Meta-Analysis"[pt] OR '
+        '"Systematic Review"[pt] OR "Practice Guideline"[pt])'
+    )
+    core = " AND ".join(blocks)
+    noise = pubmed_noise_exclusion_clause(graph)
+    return f"{core} {noise}".strip() if noise else core
+
+
+def build_landmark_rescue_query_for_graph(graph: ClinicalIntentGraph) -> str:
+    """Query de rescate cuando faltan landmarks esperados en el pool."""
+    from app.capabilities.evidence_rag.clinical_intent_graph import _is_anticoag_comparative
+
+    if _is_anticoag_comparative(graph):
+        return build_anticoag_landmark_rescue_query(graph)
+    if graph.expected_landmark_trials and graph.outcome_theme == "cv":
+        return landmark_cvot_retrieval_clause()
+    return ""
+
+
+def build_anticoag_landmark_rescue_query(graph: ClinicalIntentGraph) -> str:
+    """Rescate: ensayos landmark de anticoagulación cuando faltan en el pool."""
+    land = landmark_anticoag_retrieval_clause()
+    if not land:
+        return ""
+    pop = expand_cohort_token_for_pubmed("atrial fibrillation")
+    if pop:
+        return f"({land}) AND ({pop})"
+    return land
+
+
+def build_evidence_retrieval_stages_for_graph(
+    graph: ClinicalIntentGraph,
+    free_text: str,
+    pop_conds: list[str],
+    ctx: ClinicalContext | None,
+) -> list[RetrievalStage]:
+    """Plan de recuperación guiado por Clinical Intent Graph."""
+    intent = graph.to_clinical_intent()
+    theme = graph.outcome_theme or primary_outcome_theme(intent)
+
+    if graph.question_type in ("comparative_effectiveness", "treatment_selection"):
+        from app.capabilities.evidence_rag.clinical_intent_graph import _is_anticoag_comparative
+
+        if _is_anticoag_comparative(graph):
+            stages: list[RetrievalStage] = []
+            primary = build_comparative_anticoag_primary_query(graph)
+            if primary:
+                stages.append(
+                    RetrievalStage(
+                        stage_id="anticoag_comparative_primary",
+                        query=primary,
+                        stop_after_if_pmids_at_least=15,
+                        stage_role="primary",
+                        retrieval_tier=RetrievalTier.T1_EXACT_PICO,
+                    )
+                )
+            land_q = build_anticoag_landmark_rescue_query(graph)
+            if land_q:
+                stages.append(
+                    RetrievalStage(
+                        stage_id="anticoag_landmark",
+                        query=land_q,
+                        years_back_override=20,
+                        stage_role="supplemental",
+                        retrieval_tier=RetrievalTier.T2_LANDMARK_CVOT,
+                    )
+                )
+            if stages:
+                return stages
+
+    if theme == "safety" or graph.question_type == "adverse_effect":
+        q = build_policy_driven_query(intent, free_text, pop_conds)
+        return (
+            [RetrievalStage(stage_id="safety_primary", query=q, retrieval_tier=RetrievalTier.T1_EXACT_PICO)]
+            if q
+            else []
+        )
+
+    if graph.question_type == "guideline_lookup":
+        g_blocks = _graph_iv_pubmed_blocks(graph) or _population_blocks(intent, pop_conds)
+        clause = (
+            '("Practice Guideline"[pt] OR "Guideline"[pt] OR "consensus"[tiab] OR '
+            '"position statement"[tiab])'
+        )
+        if g_blocks:
+            q = f"({' OR '.join(g_blocks[:2])}) AND {clause}"
+            noise = pubmed_noise_exclusion_clause(graph)
+            if noise:
+                q = f"{q} {noise}"
+            return [RetrievalStage(stage_id="guideline_primary", query=q, retrieval_tier=RetrievalTier.T1_EXACT_PICO)]
+
+    return []
 
 
 def build_evidence_search_query(
@@ -272,9 +439,14 @@ def build_evidence_retrieval_stages(
         return []
 
     ctx = as_clinical_context(clinical_context)
-    intent = extract_clinical_intent(core, ctx)
+    graph = build_clinical_intent_graph(core, ctx)
+    intent = graph.to_clinical_intent()
     pop_conds = [c for c in (ctx.population_conditions or []) if str(c).strip()] if ctx else []
-    theme = primary_outcome_theme(intent)
+    theme = graph.outcome_theme or primary_outcome_theme(intent)
+
+    graph_stages = build_evidence_retrieval_stages_for_graph(graph, core, pop_conds, ctx)
+    if graph_stages:
+        return graph_stages
 
     if not _broad_pubmed_retrieval_enabled():
         q = build_policy_driven_query(intent, core, pop_conds)
