@@ -12,25 +12,7 @@ Inspiración de introspección / cohortes: proyecto hermano ``sina_mcp/sqlite-an
 from __future__ import annotations
 
 import re
-import unicodedata
 from dataclasses import dataclass
-
-# (subcadenas normalizadas que disparan el filtro, fragmento LIKE seguro [a-z0-9])
-_CONDITION_TRIGGERS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("diabet",), "diabet"),
-    (("hipertens",), "hipertens"),
-    (("asma",), "asma"),
-    (("epoc", "copd",), "obstruct"),
-    (("insuficiencia cardiaca", "heart failure", "insuf cardiaca"), "cardiac"),
-)
-
-_MED_TRIGGERS: tuple[tuple[tuple[str, ...], str], ...] = (
-    (("metform",), "metform"),
-    (("aspirin", "aspirina", "acido acetilsalicilico", "ácido acetilsalicílico"), "aspir"),
-    (("insulin", "insulina",), "insulin"),
-    (("losartan",), "losartan"),
-    (("enalapril",), "enalapril"),
-)
 
 
 @dataclass
@@ -42,6 +24,7 @@ class CohortNLSpec:
     min_age_years: int | None = None
     max_age_years: int | None = None
     alive_only: bool = True
+    sex: str | None = None  # "F" | "M" — columna ``gender``/``sex`` en patients si existe
 
     def has_filters(self) -> bool:
         return bool(
@@ -49,70 +32,16 @@ class CohortNLSpec:
             or self.medication_like_tokens
             or self.min_age_years is not None
             or self.max_age_years is not None
+            or (self.sex is not None and str(self.sex).strip() != "")
         )
 
 
-def _fold(s: str) -> str:
-    """Minúsculas y sin tildes para matching simple."""
-    if not s:
-        return ""
-    nfd = unicodedata.normalize("NFD", s.lower())
-    return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
-
-
 def extract_cohort_nl_heuristic(user_query: str) -> CohortNLSpec:
-    q = _fold(user_query or "")
+    """Delega en el parser estructurado (``clinical_sql``) para una sola fuente de heurísticas."""
+    from app.capabilities.clinical_sql.cohort_parser import parse_cohort_query
+    from app.capabilities.clinical_sql.sql_builder import cohort_query_to_nl_spec
 
-    conds: list[str] = []
-    for triggers, like_tok in _CONDITION_TRIGGERS:
-        if any(t in q for t in triggers):
-            if like_tok not in conds:
-                conds.append(like_tok)
-
-    meds: list[str] = []
-    for triggers, like_tok in _MED_TRIGGERS:
-        if any(t in q for t in triggers):
-            if like_tok not in meds:
-                meds.append(like_tok)
-
-    min_age: int | None = None
-    max_age: int | None = None
-    for pat in (
-        r"mayores?\s+de\s+(\d{1,3})\b",
-        r"mas\s+de\s+(\d{1,3})\b",
-        r">\s*(\d{1,3})\b",
-        r"desde\s+los?\s+(\d{1,3})\b",
-    ):
-        m = re.search(pat, q)
-        if m:
-            v = int(m.group(1))
-            if 0 <= v <= 120:
-                min_age = v
-            break
-    for pat in (
-        r"menores?\s+de\s+(\d{1,3})\b",
-        r"menos\s+de\s+(\d{1,3})\b",
-        r"<\s*(\d{1,3})\b",
-    ):
-        m = re.search(pat, q)
-        if m:
-            v = int(m.group(1))
-            if 0 <= v <= 120:
-                max_age = v
-            break
-    m = re.search(r"\b(\d{1,3})\s*a(?:n|ñ)os?\b", q)
-    if m and min_age is None and max_age is None:
-        v = int(m.group(1))
-        if 0 <= v <= 120:
-            min_age = v
-
-    return CohortNLSpec(
-        condition_like_tokens=tuple(conds),
-        medication_like_tokens=tuple(meds),
-        min_age_years=min_age,
-        max_age_years=max_age,
-        alive_only=True,
-    )
+    return cohort_query_to_nl_spec(parse_cohort_query(user_query))
 
 
 def _pick_col(cols: set[str], *candidates: str) -> str | None:
@@ -121,6 +50,62 @@ def _pick_col(cols: set[str], *candidates: str) -> str | None:
         if c.lower() in lower:
             return lower[c.lower()]
     return None
+
+
+def _group_like_tokens_for_or(tokens: tuple[str, ...]) -> list[tuple[str, ...]]:
+    """
+    Agrupa tokens que son variantes/sinónimos (substring o prefijo común) para un OR interno.
+
+    Distintos grupos se combinan con AND (p. ej. diabetes + hipertensión).
+    """
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for tok in tokens:
+        safe = re.sub(r"[^a-z0-9]", "", tok.lower())[:40]
+        if not safe or safe in seen:
+            continue
+        seen.add(safe)
+        uniq.append(safe)
+    if not uniq:
+        return []
+
+    def related(a: str, b: str) -> bool:
+        if not a or not b:
+            return False
+        if a in b or b in a:
+            return True
+        if len(a) >= 4 and len(b) >= 4 and (a.startswith(b) or b.startswith(a)):
+            return True
+        return False
+
+    parent = list(range(len(uniq)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(len(uniq)):
+        for j in range(i + 1, len(uniq)):
+            if related(uniq[i], uniq[j]):
+                union(i, j)
+
+    buckets: dict[int, list[str]] = {}
+    order_roots: list[int] = []
+    for i in range(len(uniq)):
+        r = find(i)
+        if r not in buckets:
+            order_roots.append(r)
+            buckets[r] = []
+        if uniq[i] not in buckets[r]:
+            buckets[r].append(uniq[i])
+    return [tuple(buckets[r]) for r in order_roots]
 
 
 def build_synthea_cohort_count_sql(
@@ -185,33 +170,62 @@ def build_synthea_cohort_count_sql(
     if spec.alive_only and death:
         where_alive = f' AND COALESCE(TRIM(p."{death}"), \'\') = \'\''
 
+    where_sex = ""
+    sx = (spec.sex or "").strip().upper()[:1]
+    if sx in ("F", "M"):
+        gcol = _pick_col(patient_cols, "gender", "sex")
+        if gcol:
+            where_sex = f' AND UPPER(SUBSTR(TRIM(p."{gcol}"), 1, 1)) = \'{sx}\''
+        else:
+            warns.append("sql: filtro sexo ignorado (sin columna gender/sex en patients)")
+
     where_age = ""
     if age_parts:
         where_age = " AND " + " AND ".join(age_parts)
 
     exists_c = ""
-    for tok in spec.condition_like_tokens:
-        safe = re.sub(r"[^a-z0-9]", "", tok.lower())[:40]
-        if not safe:
+    for group in _group_like_tokens_for_or(spec.condition_like_tokens):
+        if not group:
             continue
-        exists_c += (
-            f' AND EXISTS (SELECT 1 FROM conditions c WHERE c."{cp}" = p."{pid}" '
-            f'AND LOWER(COALESCE(c."{cd}", \'\')) LIKE \'%{safe}%\')'
-        )
+        if len(group) == 1:
+            safe = group[0]
+            exists_c += (
+                f' AND EXISTS (SELECT 1 FROM conditions c WHERE c."{cp}" = p."{pid}" '
+                f'AND LOWER(COALESCE(c."{cd}", \'\')) LIKE \'%{safe}%\')'
+            )
+        else:
+            ors = " OR ".join(
+                f'LOWER(COALESCE(c."{cd}", \'\')) LIKE \'%{tok}%\''
+                for tok in group
+            )
+            exists_c += (
+                f' AND EXISTS (SELECT 1 FROM conditions c WHERE c."{cp}" = p."{pid}" '
+                f"AND ({ors}))"
+            )
 
     exists_m = ""
-    for tok in spec.medication_like_tokens:
-        safe = re.sub(r"[^a-z0-9]", "", tok.lower())[:40]
-        if not safe:
+    for group in _group_like_tokens_for_or(spec.medication_like_tokens):
+        if not group:
             continue
-        exists_m += (
-            f' AND EXISTS (SELECT 1 FROM medications m WHERE m."{mp}" = p."{pid}" '
-            f'AND LOWER(COALESCE(m."{md}", \'\')) LIKE \'%{safe}%\')'
-        )
+        if len(group) == 1:
+            safe = group[0]
+            exists_m += (
+                f' AND EXISTS (SELECT 1 FROM medications m WHERE m."{mp}" = p."{pid}" '
+                f'AND LOWER(COALESCE(m."{md}", \'\')) LIKE \'%{safe}%\')'
+            )
+        else:
+            ors = " OR ".join(
+                f'LOWER(COALESCE(m."{md}", \'\')) LIKE \'%{tok}%\''
+                for tok in group
+            )
+            exists_m += (
+                f' AND EXISTS (SELECT 1 FROM medications m WHERE m."{mp}" = p."{pid}" '
+                f"AND ({ors}))"
+            )
 
     inner = (
         f'SELECT DISTINCT p."{pid}" AS _pid FROM patients p WHERE 1=1'
-        f"{where_alive}{where_age}{exists_c}{exists_m}"
+        f"{where_alive}{where_sex}{where_age}{exists_c}{exists_m}"
     )
     sql = f"SELECT COUNT(*) AS cohort_size FROM ({inner}) AS _cohort"
     return sql, warns

@@ -9,8 +9,10 @@ Contrato público:
 
 Precedencia de reglas (orden importa):
     1. Solo señales SQL (sin evidencia)   → SQL  (cohortes / analytics primero)
-    2. Señales SQL *y* evidencia          → HYBRID
-    3. Evidencia + contexto de paciente   → HYBRID  (p. ej. «paciente con …» + evidencia)
+    1b. SQL y evidencia empatados sin pregunta explícita de literatura → AMBIGUOUS (fase 3.3)
+    2. Señales SQL *y* evidencia (intención clara) → HYBRID
+    3. Evidencia + contexto de paciente   → HYBRID  (p. ej. «paciente con …» + evidencia;
+       «paciente con» también cuenta como señal SQL ligera para trazas coherentes con cohort_sql)
     4. Frases puente híbridas explícitas  → HYBRID
     5. Solo señales de evidencia          → EVIDENCE
     6. Sin señales claras                 → UNKNOWN
@@ -29,6 +31,36 @@ import re
 from dataclasses import dataclass, field
 
 from app.schemas.copilot_state import Route
+
+
+def _explicit_evidence_question(normalized: str) -> bool:
+    """True si el texto pide literatura/evidencia de forma inequívoca (no solo términos sueltos)."""
+    needles = (
+        "que evidencia",
+        "qué evidencia",
+        "que estudios",
+        "qué estudios",
+        "evidencia existe",
+        "existe evidencia",
+        "hay evidencia",
+        "que dice la evidencia",
+        "qué dice la evidencia",
+        "pubmed",
+        "literatura",
+        "bibliografia",
+        "bibliografía",
+        "revision sistematica",
+        "revisión sistemática",
+        "meta-analisis",
+        "meta-análisis",
+        "guia clinica",
+        "guía clínica",
+        "recomendacion clinica",
+        "recomendación clínica",
+        "investigacion reciente",
+        "investigación reciente",
+    )
+    return any(n in normalized for n in needles)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +89,11 @@ class RouteSignals:
         "listar", "lista los", "lista las", "listado",
         # Entidades de BD
         "pacientes", "cohorte", "registros",
+        # Descripción de caso / población (señal SQL «ligera»: acota cohorte aunque no diga «cuántos»)
+        "paciente con",
+        "pacientes con",
+        "mayor de",
+        "mayores de",
         # Demografía / estadística de BD
         "demografía", "demografia",
         "distribución", "distribucion",
@@ -161,6 +198,10 @@ _DISCLAIMERS: dict[Route, str] = {
         "No se pudo determinar el tipo de consulta. "
         "Por favor reformule la pregunta o consulte con un profesional sanitario."
     ),
+    Route.AMBIGUOUS: (
+        "La consulta admite varias interpretaciones (datos locales vs evidencia científica). "
+        "Indique su preferencia antes de continuar."
+    ),
 }
 
 
@@ -168,12 +209,15 @@ _DISCLAIMERS: dict[Route, str] = {
 # Funciones auxiliares
 # ---------------------------------------------------------------------------
 
-def _normalize(text: str) -> str:
+def normalize_query(text: str) -> str:
     """
     Minúsculas + colapsa espacios múltiples.
     Las tildes se preservan intencionalmente para casar con señales acentuadas.
     """
     return re.sub(r"\s+", " ", text.lower().strip())
+
+
+_normalize = normalize_query  # alias interno por compatibilidad
 
 
 def _count_signals(normalized: str, signals: frozenset[str]) -> int:
@@ -218,6 +262,20 @@ def classify_route(query: str) -> tuple[Route, str]:
     # Regla 1: datos locales / analytics sin pedir literatura
     if sql_n >= 1 and ev_n == 0:
         return Route.SQL, f"{base_reason} → sql only (no evidence signals)"
+
+    # Regla 1b: empate SQL/evidencia sin puente híbrido ni pregunta explícita → aclarar
+    if sql_n >= 1 and ev_n >= 1:
+        strong_hybrid = hybrid_n >= 1 or _patient_context_with_evidence(norm)
+        explicit_lit = _explicit_evidence_question(norm)
+        if (
+            not strong_hybrid
+            and not explicit_lit
+            and sql_n == ev_n
+        ):
+            return (
+                Route.AMBIGUOUS,
+                f"{base_reason} → ambiguous (tied sql/evidence counts, no explicit literature ask)",
+            )
 
     # Regla 2: señales SQL y de evidencia en la misma consulta
     if sql_n >= 1 and ev_n >= 1:
