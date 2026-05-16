@@ -1,0 +1,8 @@
+{
+  "include": ["app", "tests", "scripts", "conftest.py"],
+  "exclude": ["**/__pycache__", ".venv"],
+  "venvPath": "/datos/pyenvs",
+  "venv": "pyenv311_CUDA12",
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic"
+}
