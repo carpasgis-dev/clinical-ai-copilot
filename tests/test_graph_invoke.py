@@ -114,12 +114,15 @@ def test_invoke_sql_route(graph_stub) -> None:
     assert result["sql_result"]["row_count"] == 1
     ids = _node_ids(result["trace"])
     assert ids[0] == NodeName.ROUTER.value
+    assert ids[1] == NodeName.PLANNER.value
     assert NodeName.SQL.value in ids
     assert NodeName.SYNTHESIS.value in ids
     assert NodeName.SAFETY.value in ids
     assert result["disclaimer"]
     assert result["disclaimer"] in result["final_answer"]
-    assert len(result["trace"]) == 4
+    assert len(result["trace"]) == 6
+    ep = result.get("execution_plan") or []
+    assert [s["kind"] for s in ep] == ["cohort_sql", "synthesis", "safety"]
     warns = result.get("warnings") or []
     assert any("stub" in w for w in warns)
 
@@ -134,9 +137,29 @@ def test_invoke_evidence_route(graph_stub) -> None:
     assert result["route"] == Route.EVIDENCE
     assert result["evidence_bundle"]["pmids"]
     ids = _node_ids(result["trace"])
+    assert ids[1] == NodeName.PLANNER.value
+    assert NodeName.PUBMED_QUERY_BUILDER.value in ids
     assert NodeName.EVIDENCE_RETRIEVAL.value in ids
     assert NodeName.SYNTHESIS.value in ids
-    assert len(result["trace"]) == 4
+    assert ids == [
+        NodeName.ROUTER.value,
+        NodeName.PLANNER.value,
+        NodeName.PUBMED_QUERY_BUILDER.value,
+        NodeName.EVIDENCE_RETRIEVAL.value,
+        NodeName.REASONING.value,
+        NodeName.SYNTHESIS.value,
+        NodeName.SAFETY.value,
+    ]
+    ep = result.get("execution_plan") or []
+    assert [s["kind"] for s in ep] == [
+        "pubmed_query",
+        "evidence_retrieval",
+        "synthesis",
+        "safety",
+    ]
+    rs = result.get("reasoning_state")
+    assert isinstance(rs, dict)
+    assert "uncertainty_notes" in rs and "evidence_assessments" in rs
 
 
 def test_trace_reducer_preserves_order_sql_path(graph_stub) -> None:
@@ -150,7 +173,9 @@ def test_trace_reducer_preserves_order_sql_path(graph_stub) -> None:
     assert result["route"] == Route.SQL
     assert _node_ids(result["trace"]) == [
         NodeName.ROUTER.value,
+        NodeName.PLANNER.value,
         NodeName.SQL.value,
+        NodeName.REASONING.value,
         NodeName.SYNTHESIS.value,
         NodeName.SAFETY.value,
     ]
@@ -167,9 +192,77 @@ def test_invoke_hybrid_hero_route(graph_stub) -> None:
     assert result.get("pubmed_query")
     assert len(result["evidence_bundle"]["articles"]) >= 1
     ids = _node_ids(result["trace"])
+    assert ids[0] == NodeName.ROUTER.value
+    assert ids[1] == NodeName.PLANNER.value
     assert NodeName.CLINICAL_SUMMARY.value in ids
     assert NodeName.PUBMED_QUERY_BUILDER.value in ids
     assert ids.count(NodeName.EVIDENCE_RETRIEVAL.value) == 1
+
+
+def test_invoke_hybrid_runs_cohort_sql_with_clinical_db(tmp_path) -> None:
+    """Híbrido + SQLite: cohorte NL→SQL antes de PubMed; ``sql_result`` en el estado final."""
+    from app.capabilities.clinical_sql.terminology import clear_terminology_cache
+
+    db = tmp_path / "hybrid_cohort.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE patients (id TEXT, birthdate TEXT, deathdate TEXT)")
+    conn.execute(
+        "INSERT INTO patients VALUES "
+        "('p-old', '1950-06-01', ''),"
+        "('p-young', '2010-01-01', '')"
+    )
+    conn.execute("CREATE TABLE conditions (patient TEXT, description TEXT)")
+    conn.execute(
+        "INSERT INTO conditions VALUES "
+        "('p-old', 'Type 2 diabetes mellitus'),"
+        "('p-young', 'Type 2 diabetes mellitus')"
+    )
+    conn.execute("CREATE TABLE medications (patient TEXT, description TEXT)")
+    conn.execute(
+        "INSERT INTO medications VALUES "
+        "('p-old', 'Metformin 500 MG Oral Tablet'),"
+        "('p-young', 'Metformin 500 MG Oral Tablet')"
+    )
+    conn.commit()
+    conn.close()
+    clear_terminology_cache()
+    cap = SqliteClinicalCapability(db_path=str(db))
+    g = build_copilot_graph(evidence=StubEvidenceCapability(), clinical=cap)
+    q = (
+        "Paciente con diabetes mayores de 65. ¿Qué evidencia existe sobre metformina "
+        "y riesgo cardiovascular?"
+    )
+    result = g.invoke({"user_query": q, "session_id": "hybrid-sql-1"})
+    assert result["route"] == Route.HYBRID
+    assert result.get("sql_result") is not None
+    assert result["sql_result"]["row_count"] == 1
+    fa = result.get("final_answer") or ""
+    assert "En la cohorte local" in fa
+    assert "PMID" in fa
+    assert "aged[MeSH Terms]" in (result.get("pubmed_query") or "")
+
+
+def test_invoke_ambiguous_route_clarify_then_safety(graph_stub) -> None:
+    """Ruta ambiguous: router → planner → clarify → safety (sin razonamiento clínico aún)."""
+    result = graph_stub.invoke(
+        {
+            "user_query": "pacientes cohorte evidencia efectividad",
+            "session_id": "test-amb-1",
+        }
+    )
+    assert result["route"] == Route.AMBIGUOUS
+    assert result.get("needs_clarification") is True
+    assert result.get("clarification_question")
+    assert result.get("reasoning_state") is None
+    ids = _node_ids(result["trace"])
+    assert ids == [
+        NodeName.ROUTER.value,
+        NodeName.PLANNER.value,
+        NodeName.CLARIFY.value,
+        NodeName.SAFETY.value,
+    ]
+    ep = result.get("execution_plan") or []
+    assert [s["kind"] for s in ep] == ["clarify", "safety"]
 
 
 def test_invoke_unknown_route(graph_stub) -> None:
@@ -177,9 +270,17 @@ def test_invoke_unknown_route(graph_stub) -> None:
         {"user_query": "Hola", "session_id": "test-unknown-1"}
     )
     assert result["route"] == Route.UNKNOWN
+    assert result.get("reasoning_state") is None
     ids = _node_ids(result["trace"])
+    assert ids[0] == NodeName.ROUTER.value
+    assert ids[1] == NodeName.PLANNER.value
     assert NodeName.FALLBACK.value in ids
+    ma = result.get("medical_answer")
+    assert isinstance(ma, dict)
+    assert ma.get("summary")
+    assert ma.get("limitations")
     assert NodeName.SYNTHESIS.value not in ids
+    assert NodeName.REASONING.value not in ids
     assert NodeName.SAFETY.value in ids
 
 

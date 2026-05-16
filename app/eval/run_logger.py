@@ -25,6 +25,8 @@ def _default_log_path() -> Path:
 
 def _log_path() -> Path:
     raw = os.getenv("COPILOT_EVAL_LOG_PATH", "").strip()
+    if "#" in raw:
+        raw = raw.split("#", 1)[0].strip()
     if raw:
         p = Path(raw).expanduser()
         return p.resolve() if p.is_absolute() else (_REPO_ROOT / p).resolve()

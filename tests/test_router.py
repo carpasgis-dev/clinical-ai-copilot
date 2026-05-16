@@ -5,7 +5,7 @@ Estos tests son la documentación viva del comportamiento del sistema.
 Cada caso representa un "golden path" documentado o un caso límite.
 
 Estructura:
-    - Tablas de casos por ruta (SQL / EVIDENCE / HYBRID / UNKNOWN)
+    - Tablas de casos por ruta (SQL / EVIDENCE / HYBRID / UNKNOWN / AMBIGUOUS)
     - Tests parametrizados que fallan con mensajes claros
     - Tests de propiedades (pureza, cobertura)
     - Test del caso HERO del spec
@@ -165,6 +165,14 @@ UNKNOWN_CASES: list[tuple[str, Route, str]] = [
     ),
 ]
 
+AMBIGUOUS_CASES: list[tuple[str, Route, str]] = [
+    (
+        "pacientes cohorte evidencia efectividad",
+        Route.AMBIGUOUS,
+        "empate sql vs evidencia sin pregunta explícita de literatura",
+    ),
+]
+
 
 # ---------------------------------------------------------------------------
 # Tests parametrizados por ruta
@@ -208,6 +216,18 @@ def test_hybrid_route(query: str, expected_route: Route, description: str) -> No
 
 @pytest.mark.parametrize("query,expected_route,description", UNKNOWN_CASES)
 def test_unknown_route(query: str, expected_route: Route, description: str) -> None:
+    route, reason = classify_route(query)
+    assert route == expected_route, (
+        f"\n[{description}]\n"
+        f"  query    = {query!r}\n"
+        f"  esperado = {expected_route.value}\n"
+        f"  obtenido = {route.value}\n"
+        f"  razón    = {reason!r}"
+    )
+
+
+@pytest.mark.parametrize("query,expected_route,description", AMBIGUOUS_CASES)
+def test_ambiguous_route(query: str, expected_route: Route, description: str) -> None:
     route, reason = classify_route(query)
     assert route == expected_route, (
         f"\n[{description}]\n"
@@ -269,7 +289,7 @@ def test_router_is_pure() -> None:
 
 def test_router_always_returns_reason() -> None:
     """El router siempre devuelve una razón no vacía."""
-    all_cases = SQL_CASES + EVIDENCE_CASES + HYBRID_CASES + UNKNOWN_CASES
+    all_cases = SQL_CASES + EVIDENCE_CASES + HYBRID_CASES + UNKNOWN_CASES + AMBIGUOUS_CASES
     for query, _, _ in all_cases:
         _, reason = classify_route(query)
         assert isinstance(reason, str) and len(reason) > 0, (
@@ -279,7 +299,7 @@ def test_router_always_returns_reason() -> None:
 
 def test_router_always_returns_valid_route() -> None:
     """El router siempre devuelve un valor válido de Route."""
-    all_cases = SQL_CASES + EVIDENCE_CASES + HYBRID_CASES + UNKNOWN_CASES
+    all_cases = SQL_CASES + EVIDENCE_CASES + HYBRID_CASES + UNKNOWN_CASES + AMBIGUOUS_CASES
     valid_routes = set(Route)
     for query, _, _ in all_cases:
         route, _ = classify_route(query)
