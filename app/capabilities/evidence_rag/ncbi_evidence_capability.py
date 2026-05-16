@@ -1,3 +1,4 @@
+
 """
 Implementación de ``EvidenceCapability`` sobre NCBI E-utilities (PRSN/pubmed).
 
@@ -5,19 +6,21 @@ La query la construye un ``EvidenceQueryPlanner`` (heurística, LLM o composite)
 """
 from __future__ import annotations
 
+from app.config.settings import settings
+
 from typing import Optional, Union
 
 import httpx
 
-from app.capabilities.evidence_rag.ncbi.eutils import esearch_pubmed, search_and_fetch_abstracts
+from app.capabilities.evidence_rag.ncbi.eutils import esearch_pubmed
+from app.capabilities.evidence_rag.ncbi.eutils_async import search_and_fetch_parallel_aware
+from app.capabilities.evidence_rag.ncbi.pubmed_query_normalizer import retrieval_metrics_for_query
 from app.capabilities.evidence_rag.query_planning.protocol import EvidenceQueryPlanner
 from app.capabilities.evidence_rag.query_planning.resolver import resolve_query_planner
 from app.schemas.copilot_state import (
     ArticleSummary,
     ClinicalContext,
     EvidenceBundle,
-    _ARTICLE_MAX_SNIPPET,
-    _EVIDENCE_MAX_ART,
 )
 
 
@@ -46,23 +49,39 @@ class NcbiEvidenceCapability:
     ) -> EvidenceBundle:
         term = (pubmed_query or "").strip()
         if not term:
-            return EvidenceBundle(search_term="", pmids=[], articles=[])
+            return EvidenceBundle(
+                search_term="",
+                pmids=[],
+                articles=[],
+                retrieval_debug={
+                    "outcome": "no_query",
+                    "attempts": [],
+                    "errors": ["término PubMed vacío"],
+                    "final_idlist_length": 0,
+                    "articles_parsed": 0,
+                    "pubmed_query_planned": "",
+                    "normalized_query": "",
+                    "final_query_sent": "",
+                    "normalization": {"warnings": [], "steps_applied": []},
+                    "retrieval_metrics": retrieval_metrics_for_query(""),
+                },
+            )
 
-        cap = min(max(retmax, 1), 10, _EVIDENCE_MAX_ART)
+        fetch_cap = max(
+            1,
+            min(max(int(retmax), 1), int(settings.evidence_retrieval_pool_max)),
+        )
         yb: Optional[int] = years_back if years_back and years_back > 0 else None
 
-        try:
-            records = search_and_fetch_abstracts(
-                term,
-                retmax=cap,
-                pubmed_years_back=yb,
-            )
-        except Exception:
-            return EvidenceBundle(search_term=term, pmids=[], articles=[])
+        records, dbg = search_and_fetch_parallel_aware(
+            term,
+            retmax=fetch_cap,
+            pubmed_years_back=yb,
+        )
 
         articles: list[ArticleSummary] = []
         pmids: list[str] = []
-        for rec in records[:_EVIDENCE_MAX_ART]:
+        for rec in records[:fetch_cap]:
             pmids.append(rec.pmid)
             y_int: Optional[int] = None
             if rec.year and str(rec.year).isdigit():
@@ -71,7 +90,7 @@ class NcbiEvidenceCapability:
                 ArticleSummary(
                     pmid=rec.pmid,
                     title=rec.title,
-                    abstract_snippet=(rec.abstract or "")[:_ARTICLE_MAX_SNIPPET],
+                    abstract_snippet=(rec.abstract or "")[:settings.article_max_snippet],
                     year=y_int,
                     doi=rec.doi,
                     open_access=None,
@@ -84,6 +103,7 @@ class NcbiEvidenceCapability:
             articles=articles,
             chunks_used=0,
             oa_pdfs_retrieved=0,
+            retrieval_debug=dbg,
         )
 
     def health_check(self) -> bool:

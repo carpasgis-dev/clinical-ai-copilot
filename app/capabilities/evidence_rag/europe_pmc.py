@@ -1,3 +1,4 @@
+
 """
 Cliente Europe PMC REST + ``EvidenceCapability``.
 
@@ -6,6 +7,8 @@ API: https://www.ebi.ac.uk/europepmc/webservices/rest/search
 El grafo y los DTOs no cambian: se devuelve ``EvidenceBundle`` / ``ArticleSummary``.
 """
 from __future__ import annotations
+
+from app.config.settings import settings
 
 from datetime import date
 from typing import Any, Dict, List, Optional, Union
@@ -18,8 +21,8 @@ from app.schemas.copilot_state import (
     ArticleSummary,
     ClinicalContext,
     EvidenceBundle,
-    _ARTICLE_MAX_SNIPPET,
-    _EVIDENCE_MAX_ART,
+
+
 )
 
 EUROPE_PMC_SEARCH = (
@@ -119,6 +122,45 @@ def search_europe_pmc(
             client.close()
 
 
+async def search_europe_pmc_async(
+    query: str,
+    *,
+    page_size: int = 6,
+    years_back: int = 0,
+    client: Optional[httpx.AsyncClient] = None,
+) -> List[Dict[str, Any]]:
+    """Versión async de ``search_europe_pmc`` para ``asyncio.gather``."""
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    params: Dict[str, Any] = {
+        "query": q + _pdat_filter_clause(years_back),
+        "format": "json",
+        "pageSize": min(max(page_size, 1), 25),
+        "resultType": "core",
+        "src": "MED",
+    }
+    own = client is None
+    if own:
+        client = httpx.AsyncClient(timeout=60.0)
+    try:
+        assert client is not None
+        r = await client.get(EUROPE_PMC_SEARCH, params=params)
+        r.raise_for_status()
+        data = r.json()
+        rlist = data.get("resultList") or {}
+        results = rlist.get("result")
+        if not results:
+            return []
+        if isinstance(results, dict):
+            return [results]
+        return list(results)
+    finally:
+        if own and client is not None:
+            await client.aclose()
+
+
 class EuropePmcCapability:
     """
     Misma superficie que ``NcbiEvidenceCapability``: solo cambia la capa HTTP/API.
@@ -147,21 +189,31 @@ class EuropePmcCapability:
         if not term:
             return EvidenceBundle(search_term="", pmids=[], articles=[])
 
-        cap = min(max(retmax, 1), 10, _EVIDENCE_MAX_ART)
+        cap = min(max(retmax, 1), 10, settings.evidence_max_art)
         yb = years_back if years_back and years_back > 0 else 0
 
         try:
-            hits = search_europe_pmc(
-                term,
-                page_size=cap,
-                years_back=yb,
+            from app.capabilities.evidence_rag.retrieval_parallel import (
+                parallel_retrieval_enabled,
+                run_coroutine_sync,
             )
+
+            if parallel_retrieval_enabled():
+                hits = run_coroutine_sync(
+                    search_europe_pmc_async(term, page_size=cap, years_back=yb)
+                )
+            else:
+                hits = search_europe_pmc(
+                    term,
+                    page_size=cap,
+                    years_back=yb,
+                )
         except Exception:
             return EvidenceBundle(search_term=term, pmids=[], articles=[])
 
         articles: list[ArticleSummary] = []
         pmids: list[str] = []
-        for hit in hits[:_EVIDENCE_MAX_ART]:
+        for hit in hits[:settings.evidence_max_art]:
             pmid = _normalize_pmid(hit)
             if not pmid or not pmid.isdigit():
                 continue
@@ -173,7 +225,7 @@ class EuropePmcCapability:
                 ArticleSummary(
                     pmid=pmid,
                     title=title,
-                    abstract_snippet=abstract[:_ARTICLE_MAX_SNIPPET],
+                    abstract_snippet=abstract[:settings.article_max_snippet],
                     year=_parse_year(hit),
                     doi=doi_s,
                     open_access=_hit_open_access(hit),

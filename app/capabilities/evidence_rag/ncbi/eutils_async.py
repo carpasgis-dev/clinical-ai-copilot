@@ -1,15 +1,10 @@
 """
-NCBI E-utilities (PubMed): esearch + efetch (XML).
-
-Origen: ``sina_mcp/prsn3.0/src/prsn30/pubmed/eutils.py`` (misma lógica, imports locales).
-
-Política de uso: https://www.ncbi.nlm.nih.gov/books/NBK25497/
+Variantes async de E-utilities (``httpx.AsyncClient``) para recuperación paralela.
 """
 from __future__ import annotations
 
+import asyncio
 import os
-import time
-import xml.etree.ElementTree as ET
 from typing import Any, List, Optional, Tuple
 
 import httpx
@@ -17,280 +12,50 @@ import httpx
 from app.capabilities.evidence_rag.copilot_errors import CopilotError
 from app.capabilities.evidence_rag.evidence_rerank import weak_design_share_from_titles
 from app.capabilities.evidence_rag.ncbi.date_window import pdat_range_for_years_back
+from app.capabilities.evidence_rag.ncbi.eutils import (
+    EUTILS,
+    _DEFAULT_REFINE_MIN_ARTICLES_FOR_WEAK_SHARE,
+    _DEFAULT_REFINE_MIN_RESULT_COUNT,
+    _DEFAULT_REFINE_WEAK_TITLE_SHARE,
+    _ncbi_params,
+    _pubmed_transport_or_esearch_code,
+    append_synthesis_pub_types_to_pubmed_query,
+)
 from app.capabilities.evidence_rag.ncbi.pubmed_query_normalizer import (
     normalize_pubmed_query,
     retrieval_metrics_for_query,
 )
 from app.capabilities.evidence_rag.ncbi.pubmed_record import PubMedArticleRecord
-
-EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-
-# Segunda búsqueda condicional: revisiones, meta-análisis y ECA (Publication Type en PubMed).
-_PUBMED_SYNTHESIS_PUB_TYPES_CLAUSE = (
-    '(Review[pt] OR Meta-Analysis[pt] OR "Randomized Controlled Trial"[pt])'
+from app.capabilities.evidence_rag.ncbi.eutils import (
+    parse_pubmed_fetch_xml_safe,
+    search_and_fetch_with_debug,
 )
 
-# Demasiados hits en ESearch → conjunto ruidoso; primera página con muchos diseños débiles → refinar.
-_DEFAULT_REFINE_MIN_RESULT_COUNT = 2500
-_DEFAULT_REFINE_WEAK_TITLE_SHARE = 0.5
-_DEFAULT_REFINE_MIN_ARTICLES_FOR_WEAK_SHARE = 3
+
+def _ncbi_sleep_s() -> float:
+    if _sanitize_ncbi_key_present():
+        return 0.11
+    return 0.34
 
 
-def append_synthesis_pub_types_to_pubmed_query(normalized_term: str) -> str:
-    """Añade filtro OR de tipos de publicación útiles para síntesis clínica (PubMed)."""
-    t = (normalized_term or "").strip()
-    if not t:
-        return ""
-    return f"({t}) AND ({_PUBMED_SYNTHESIS_PUB_TYPES_CLAUSE})"
+def _sanitize_ncbi_key_present() -> bool:
+    raw = os.getenv("NCBI_API_KEY", "").strip()
+    if not raw or raw.startswith("#"):
+        return False
+    if "#" in raw:
+        raw = raw.split("#", 1)[0].strip()
+    return bool(raw.split()[0] if raw else "")
 
 
-def _local(tag: str) -> str:
-    return tag.split("}")[-1] if "}" in tag else tag
-
-
-def _text(el: Optional[ET.Element]) -> str:
-    if el is None:
-        return ""
-    return "".join(el.itertext()).strip()
-
-
-def _sanitize_ncbi_api_key(raw: str) -> str:
-    """
-    Evita enviar a NCBI basura típica de .env mal copiado (comentario en la misma línea
-    interpretado como valor, o texto que empieza por '#').
-    Las claves de NCBI son alfanuméricas; nos quedamos con el primer token sin '#'.
-    """
-    s = (raw or "").strip()
-    if not s or s.startswith("#"):
-        return ""
-    if "#" in s:
-        s = s.split("#", 1)[0].strip()
-    return s.split()[0] if s else ""
-
-
-def _ncbi_params() -> dict[str, str]:
-    out: dict[str, str] = {}
-    email = os.getenv("NCBI_EMAIL", "").strip()
-    if email:
-        out["email"] = email
-    key = _sanitize_ncbi_api_key(os.getenv("NCBI_API_KEY", ""))
-    if key:
-        out["api_key"] = key
-    return out
-
-
-def esearch_pubmed(
+async def esearch_pubmed_detailed_async(
     term: str,
     *,
     retmax: int = 10,
     datetype: Optional[str] = None,
     mindate: Optional[str] = None,
     maxdate: Optional[str] = None,
-    client: Optional[httpx.Client] = None,
-) -> List[str]:
-    """Devuelve lista de PMIDs (strings)."""
-    params: dict[str, Any] = {
-        "db": "pubmed",
-        "term": term,
-        "retmax": str(retmax),
-        "retmode": "json",
-        **_ncbi_params(),
-    }
-    if datetype and mindate and maxdate:
-        params["datetype"] = datetype
-        params["mindate"] = mindate
-        params["maxdate"] = maxdate
-    url = f"{EUTILS}/esearch.fcgi"
-    own = client is None
-    if own:
-        client = httpx.Client(timeout=60.0)
-    try:
-        assert client is not None
-        r = client.get(url, params=params)
-        r.raise_for_status()
-        raw = (r.text or "").strip()
-        if not raw:
-            raise ValueError(
-                "La API de NCBI (esearch) devolvió una respuesta vacía. "
-                "Compruebe red, firewall o proxy; más tarde reintente."
-            )
-        data = r.json()
-        res = data.get("esearchresult") or {}
-        err = res.get("ERROR") or res.get("ErrorMsg")
-        if err:
-            raise ValueError(f"PubMed rechazó la consulta: {err}")
-        ids = res.get("idlist") or []
-        return [str(x) for x in ids]
-    finally:
-        if own and client is not None:
-            client.close()
-
-
-def fetch_pubmed_xml(
-    pmids: List[str],
-    *,
-    client: Optional[httpx.Client] = None,
-) -> str:
-    if not pmids:
-        return ""
-    params: dict[str, Any] = {
-        "db": "pubmed",
-        "id": ",".join(pmids),
-        "retmode": "xml",
-        **_ncbi_params(),
-    }
-    url = f"{EUTILS}/efetch.fcgi"
-    own = client is None
-    if own:
-        client = httpx.Client(timeout=120.0)
-    try:
-        assert client is not None
-        r = client.get(url, params=params)
-        r.raise_for_status()
-        body = r.text or ""
-        if not body.strip():
-            raise ValueError(
-                "PubMed (efetch) devolvió XML vacío. Suele deberse a límites de red, "
-                "bloqueo temporal de NCBI o lista de PMIDs inválida."
-            )
-        return body
-    finally:
-        if own and client is not None:
-            client.close()
-
-
-def _first_year_from_pubdate(pubdate: ET.Element) -> Optional[str]:
-    for y in pubdate.iter():
-        if _local(y.tag) == "Year" and y.text:
-            return y.text.strip()
-    for m in pubdate.iter():
-        if _local(m.tag) == "MedlineDate" and m.text:
-            parts = m.text.split()
-            for p in parts:
-                if len(p) == 4 and p.isdigit():
-                    return p
-    return None
-
-
-def parse_pubmed_fetch_xml(xml_text: str) -> List[PubMedArticleRecord]:
-    if not (xml_text or "").strip():
-        return []
-    root = ET.fromstring(xml_text)
-    out: List[PubMedArticleRecord] = []
-    for art in root.iter():
-        if _local(art.tag) != "PubmedArticle":
-            continue
-        mc = next((c for c in art if _local(c.tag) == "MedlineCitation"), None)
-        if mc is None:
-            continue
-
-        pmid: Optional[str] = None
-        for el in mc.iter():
-            if _local(el.tag) == "PMID" and el.text:
-                pmid = el.text.strip()
-                break
-        if not pmid:
-            continue
-
-        title = ""
-        abstract_parts: List[str] = []
-        year: Optional[str] = None
-        doi: Optional[str] = None
-
-        article = next((c for c in mc if _local(c.tag) == "Article"), None)
-        if article is not None:
-            for el in article.iter():
-                ln = _local(el.tag)
-                if ln == "ArticleTitle":
-                    title = _text(el)
-                elif ln == "AbstractText":
-                    label = el.get("Label", "")
-                    chunk = _text(el)
-                    if label:
-                        abstract_parts.append(f"{label}: {chunk}")
-                    else:
-                        abstract_parts.append(chunk)
-                elif ln == "ELocationID" and el.get("EIdType") == "doi":
-                    doi = _text(el) or doi
-                elif ln == "Journal":
-                    for ji in el.iter():
-                        if _local(ji.tag) == "JournalIssue":
-                            for pd in ji.iter():
-                                if _local(pd.tag) == "PubDate":
-                                    year = year or _first_year_from_pubdate(pd)
-
-        for el in art.iter():
-            if _local(el.tag) == "ArticleId" and el.get("IdType") == "doi":
-                doi = _text(el) or doi
-
-        abstract = "\n\n".join(abstract_parts) if abstract_parts else ""
-
-        out.append(
-            PubMedArticleRecord(
-                pmid=pmid,
-                title=title or "(sin título)",
-                abstract=abstract or "(sin abstract disponible)",
-                year=year,
-                doi=doi,
-            )
-        )
-    return out
-
-
-def search_and_fetch_abstracts(
-    term: str,
-    *,
-    retmax: int = 8,
-    sleep_s: float = 0.34,
-    pubmed_years_back: Optional[int] = None,
-    mindate: Optional[str] = None,
-    maxdate: Optional[str] = None,
-) -> List[PubMedArticleRecord]:
-    """
-    esearch → pausa opcional (sin API key ~3 req/s) → efetch → parse.
-
-    Implementación delegada en ``search_and_fetch_with_debug`` (retrocompatibilidad).
-    """
-    recs, _dbg = search_and_fetch_with_debug(
-        term,
-        retmax=retmax,
-        sleep_s=sleep_s,
-        pubmed_years_back=pubmed_years_back,
-        mindate=mindate,
-        maxdate=maxdate,
-    )
-    return recs
-
-
-def _simplify_pubmed_boolean(term: str) -> Optional[str]:
-    """Si la query es una conjunción larga, prueba sin el último ') AND ('."""
-    t = (term or "").strip()
-    if len(t) < 40 or ") AND (" not in t:
-        return None
-    cut = t.rfind(") AND (")
-    if cut <= 0:
-        return None
-    shorter = t[: cut + 1].strip()
-    if len(shorter) < 25 or shorter == t:
-        return None
-    return shorter
-
-
-def esearch_pubmed_detailed(
-    term: str,
-    *,
-    retmax: int = 10,
-    datetype: Optional[str] = None,
-    mindate: Optional[str] = None,
-    maxdate: Optional[str] = None,
-    client: httpx.Client,
+    client: httpx.AsyncClient,
 ) -> dict[str, Any]:
-    """
-    esearch con metadatos para observabilidad.
-
-    Returns:
-        dict con keys: idlist (list[str]), result_count (int|None), http_status, error (str|None), stage.
-    """
     out: dict[str, Any] = {
         "idlist": [],
         "result_count": None,
@@ -311,7 +76,7 @@ def esearch_pubmed_detailed(
         params["maxdate"] = maxdate
     url = f"{EUTILS}/esearch.fcgi"
     try:
-        r = client.get(url, params=params)
+        r = await client.get(url, params=params)
         out["http_status"] = r.status_code
         if r.status_code >= 400:
             body = (r.text or "")[:500].replace("\n", " ").strip()
@@ -347,12 +112,11 @@ def esearch_pubmed_detailed(
     return out
 
 
-def fetch_pubmed_xml_safe(
+async def fetch_pubmed_xml_safe_async(
     pmids: List[str],
     *,
-    client: httpx.Client,
+    client: httpx.AsyncClient,
 ) -> tuple[str, Optional[str]]:
-    """efetch; devuelve (xml_text, error)."""
     if not pmids:
         return "", None
     params: dict[str, Any] = {
@@ -363,7 +127,7 @@ def fetch_pubmed_xml_safe(
     }
     url = f"{EUTILS}/efetch.fcgi"
     try:
-        r = client.get(url, params=params)
+        r = await client.get(url, params=params)
         if r.status_code != 200:
             return "", f"efetch http_status={r.status_code}"
         r.raise_for_status()
@@ -379,33 +143,11 @@ def fetch_pubmed_xml_safe(
         return "", f"efetch: {type(exc).__name__}: {exc}"
 
 
-def parse_pubmed_fetch_xml_safe(xml_text: str) -> tuple[List[PubMedArticleRecord], Optional[str]]:
-    if not (xml_text or "").strip():
-        return [], "parse: XML vacío"
-    try:
-        return parse_pubmed_fetch_xml(xml_text), None
-    except ET.ParseError as exc:
-        return [], f"parse: XML inválido: {exc}"
-    except Exception as exc:  # noqa: BLE001
-        return [], f"parse: {type(exc).__name__}: {exc}"
-
-
-def _pubmed_transport_or_esearch_code(msg: str) -> str:
-    m = (msg or "").lower()
-    if "timeout" in m:
-        return "PUBMED_TIMEOUT"
-    if "efetch" in m:
-        return "PUBMED_EFETCH_ERROR"
-    if "http" in m or "status=" in m:
-        return "PUBMED_HTTP_ERROR"
-    return "PUBMED_ESEARCH_FAILED"
-
-
-def search_and_fetch_with_debug(
+async def search_and_fetch_with_debug_async(
     term: str,
     *,
     retmax: int = 8,
-    sleep_s: float = 0.34,
+    sleep_s: Optional[float] = None,
     pubmed_years_back: Optional[int] = None,
     mindate: Optional[str] = None,
     maxdate: Optional[str] = None,
@@ -414,18 +156,9 @@ def search_and_fetch_with_debug(
     refine_weak_title_share: float = _DEFAULT_REFINE_WEAK_TITLE_SHARE,
     refine_min_articles_for_weak_share: int = _DEFAULT_REFINE_MIN_ARTICLES_FOR_WEAK_SHARE,
 ) -> Tuple[List[PubMedArticleRecord], dict[str, Any]]:
-    """
-    ``esearch`` + ``efetch`` (y opcionalmente un segundo ciclo con filtro de tipo de publicación).
-
-    Tras un primer resultado válido, si el conteo global de ESearch es muy alto o la primera
-    página es mayoritariamente «débil» por título (casos clínicos, editoriales, preclínico),
-    se intenta otra búsqueda añadiendo
-    ``Review[pt] OR Meta-Analysis[pt] OR Randomized Controlled Trial[pt]``; si falla o no hay
-    artículos parseables, se conserva el resultado primario.
-
-    Cero PMIDs con HTTP OK en el primer intento es válido (``outcome=zero_hits_esearch``).
-    Errores de red, ESearch o parseo: ``CopilotError`` con ``code``.
-    """
+    """Misma semántica que ``search_and_fetch_with_debug`` con cliente HTTP async."""
+    if sleep_s is None:
+        sleep_s = _ncbi_sleep_s()
     cap = max(1, min(retmax, 250))
     planned = (term or "").strip()
     if not planned:
@@ -466,7 +199,7 @@ def search_and_fetch_with_debug(
     else:
         label, q, use_pdat, md, xd = "primary_no_pdat", q0, False, None, None
 
-    with httpx.Client(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
         dt = "pdat" if use_pdat and md and xd else None
         att: dict[str, Any] = {
             "label": label,
@@ -481,7 +214,7 @@ def search_and_fetch_with_debug(
             "error": None,
             "articles_parsed": 0,
         }
-        es = esearch_pubmed_detailed(
+        es = await esearch_pubmed_detailed_async(
             q,
             retmax=cap,
             datetype=dt,
@@ -500,11 +233,10 @@ def search_and_fetch_with_debug(
             att["error"] = es["error"]
             msg = f"{label}: {es['error']}"
             errors.append(msg)
-            code = _pubmed_transport_or_esearch_code(msg)
-            raise CopilotError(code, msg)
+            raise CopilotError(_pubmed_transport_or_esearch_code(msg), msg)
 
         if not ids:
-            debug = {
+            return [], {
                 "outcome": "zero_hits_esearch",
                 "attempts": attempts,
                 "errors": [],
@@ -519,13 +251,12 @@ def search_and_fetch_with_debug(
                     "last_attempt_result_count": att.get("result_count"),
                 },
             }
-            return [], debug
 
         if sleep_s > 0:
-            time.sleep(sleep_s)
+            await asyncio.sleep(sleep_s)
 
         att["stage_reached"] = "efetch"
-        xml_text, ferr = fetch_pubmed_xml_safe(ids, client=client)
+        xml_text, ferr = await fetch_pubmed_xml_safe_async(ids, client=client)
         if ferr:
             att["error"] = ferr
             msg = f"{label}: {ferr}"
@@ -573,10 +304,9 @@ def search_and_fetch_with_debug(
 
         if need_refine:
             if sleep_s > 0:
-                time.sleep(sleep_s)
+                await asyncio.sleep(sleep_s)
 
             q2 = (append_synthesis_pub_types_to_pubmed_query(q) or "").strip()
-
             lbl2 = "synthesis_pub_types_pdat" if use_pdat else "synthesis_pub_types_no_pdat"
             att2: dict[str, Any] = {
                 "label": lbl2,
@@ -591,7 +321,7 @@ def search_and_fetch_with_debug(
                 "error": None,
                 "articles_parsed": 0,
             }
-            es2 = esearch_pubmed_detailed(
+            es2 = await esearch_pubmed_detailed_async(
                 q2,
                 retmax=cap,
                 datetype=dt,
@@ -617,9 +347,9 @@ def search_and_fetch_with_debug(
                 refine_meta["refined_query"] = q2
             else:
                 if sleep_s > 0:
-                    time.sleep(sleep_s)
+                    await asyncio.sleep(sleep_s)
                 att2["stage_reached"] = "efetch"
-                xml2, ferr2 = fetch_pubmed_xml_safe(ids2, client=client)
+                xml2, ferr2 = await fetch_pubmed_xml_safe_async(ids2, client=client)
                 if ferr2:
                     att2["error"] = ferr2
                     refine_meta["reason"] = refine_reason
@@ -666,5 +396,33 @@ def search_and_fetch_with_debug(
             "normalization": norm_meta,
             "retrieval_metrics": metrics,
             "synthesis_pubtype_refine": refine_meta,
+            "http_async": True,
         }
         return best_records, debug
+
+
+def search_and_fetch_parallel_aware(
+    term: str,
+    *,
+    retmax: int = 8,
+    pubmed_years_back: Optional[int] = None,
+) -> Tuple[List[PubMedArticleRecord], dict[str, Any]]:
+    """Usa async HTTP si el modo paralelo está activo; si no, delega en sync."""
+    from app.capabilities.evidence_rag.retrieval_parallel import (
+        parallel_retrieval_enabled,
+        run_coroutine_sync,
+    )
+
+    if parallel_retrieval_enabled():
+        return run_coroutine_sync(
+            search_and_fetch_with_debug_async(
+                term,
+                retmax=retmax,
+                pubmed_years_back=pubmed_years_back,
+            )
+        )
+    return search_and_fetch_with_debug(
+        term,
+        retmax=retmax,
+        pubmed_years_back=pubmed_years_back,
+    )

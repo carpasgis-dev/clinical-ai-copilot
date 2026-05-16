@@ -56,6 +56,7 @@ def test_ncbi_evidence_capability_retrieve_evidence_empty_query() -> None:
     assert b.search_term == ""
     assert b.pmids == []
     assert b.articles == []
+    assert b.retrieval_debug and b.retrieval_debug.get("outcome") == "no_query"
 
 
 def test_evidence_capability_protocol_instances() -> None:
@@ -71,3 +72,22 @@ def test_evidence_capability_protocol_instances() -> None:
     assert isinstance(StubEvidenceCapability(), EvidenceCapability)
     assert isinstance(EuropePmcCapability(), EvidenceCapability)
     assert isinstance(MultiSourceEvidenceCapability(), EvidenceCapability)
+
+
+def test_append_synthesis_pub_types_to_pubmed_query() -> None:
+    from app.capabilities.evidence_rag.ncbi.eutils import append_synthesis_pub_types_to_pubmed_query
+
+    q = append_synthesis_pub_types_to_pubmed_query(
+        'diabetes[tiab] AND ("blood pressure"[tiab])'
+    )
+    assert q.startswith("(")
+    assert "[tiab]" in q
+    assert "Review[pt]" in q and "Meta-Analysis[pt]" in q
+    assert " AND " in q
+
+
+def test_append_synthesis_pub_types_empty() -> None:
+    from app.capabilities.evidence_rag.ncbi.eutils import append_synthesis_pub_types_to_pubmed_query
+
+    assert append_synthesis_pub_types_to_pubmed_query("") == ""
+    assert append_synthesis_pub_types_to_pubmed_query("   ") == ""

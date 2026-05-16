@@ -18,7 +18,7 @@ def build_evidence_capability(backend: str | None = None) -> EvidenceCapability:
 
     ``stub`` para tests/CI sin red; ``ncbi`` (default) para PMIDs reales vía NCBI.
 
-    El planificador de query (heurística / LLM / composite) viene de ``resolve_query_planner()``
+    El planificador de query (heurística / LLM) viene de ``resolve_query_planner()``
     salvo que ``stub`` no lo use.
     """
     b = (backend or resolve_evidence_backend()).lower().strip()
