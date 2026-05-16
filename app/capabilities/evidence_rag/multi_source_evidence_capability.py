@@ -1,3 +1,4 @@
+
 """
 Capability de evidencia multi-fuente: NCBI + Europe PMC (u otras ``EvidenceCapability``).
 
@@ -6,18 +7,25 @@ El grafo y ``EvidenceBundle`` / ``ArticleSummary`` siguen siendo el contrato ún
 """
 from __future__ import annotations
 
+from app.config.settings import settings
+
 from typing import Dict, List, Optional, Sequence, Union
 
 from app.capabilities.contracts import EvidenceCapability
 from app.capabilities.evidence_rag.europe_pmc import EuropePmcCapability
 from app.capabilities.evidence_rag.ncbi_evidence_capability import NcbiEvidenceCapability
+from app.capabilities.evidence_rag.retrieval_parallel import (
+    gather_sync_calls_blocking,
+    parallel_retrieval_enabled,
+    partial_call,
+)
 from app.capabilities.evidence_rag.query_planning.protocol import EvidenceQueryPlanner
 from app.capabilities.evidence_rag.query_planning.resolver import resolve_query_planner
 from app.schemas.copilot_state import (
     ArticleSummary,
     ClinicalContext,
     EvidenceBundle,
-    _EVIDENCE_MAX_ART,
+
 )
 
 
@@ -114,22 +122,35 @@ class MultiSourceEvidenceCapability:
         if not term:
             return EvidenceBundle(search_term="", pmids=[], articles=[])
 
-        cap = min(max(retmax, 1), 10, _EVIDENCE_MAX_ART)
+        cap = min(max(retmax, 1), 10, settings.evidence_max_art)
         combined: List[ArticleSummary] = []
         chunks = 0
         oa_count = 0
 
-        for src in self._sources:
-            try:
-                b = src.retrieve_evidence(term, retmax=cap, years_back=years_back)
-            except Exception:
-                continue
+        if parallel_retrieval_enabled() and len(self._sources) > 1:
+            calls = [
+                partial_call(
+                    src.retrieve_evidence,
+                    term,
+                    retmax=cap,
+                    years_back=years_back,
+                )
+                for src in self._sources
+            ]
+            bundles = gather_sync_calls_blocking(calls, limit=len(self._sources))
+        else:
+            bundles = [
+                src.retrieve_evidence(term, retmax=cap, years_back=years_back)
+                for src in self._sources
+            ]
+
+        for b in bundles:
             chunks += int(b.chunks_used or 0)
             oa_count += int(b.oa_pdfs_retrieved or 0)
             combined.extend(b.articles)
 
         merged = _dedupe_and_merge(combined)
-        merged = merged[:_EVIDENCE_MAX_ART]
+        merged = merged[:settings.evidence_max_art]
         oa_flags = sum(1 for a in merged if a.open_access is True)
         return EvidenceBundle(
             search_term=term,
