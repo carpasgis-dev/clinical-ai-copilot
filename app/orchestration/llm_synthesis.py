@@ -68,6 +68,17 @@ B) Si «pregunta_pide_comparacion_terapeutica_directa» es **false**:
    título «Síntesis sobre la comparación solicitada» ni hables de «comparación directa»
    salvo que la pregunta lo pida.
 
+CALIBRACIÓN Y TIERS (JSON «calibracion_sintesis» y «citas_pubmed»):
+- Si «calibracion_sintesis.retrieval_outcome» es «partial_primary_miss», indica que la búsqueda PubMed
+  estricta (PICO) no recuperó suficientes candidatos y que parte de la evidencia viene de etapas ampliadas.
+- Si «nivel_epistemico_busqueda» ≥ 4 en una cita, PROHIBIDO afirmar eficacia clínica directa o reducción
+  de eventos; usa formulaciones prudentes y menciona «expansión de búsqueda».
+- Si «nivel_epistemico_busqueda» es 2 y existe «landmark_conocido», puedes citar el ensayo como referencia
+  contextual, sin extrapolar cifras no presentes en el extracto.
+- La cohorte local (SQL) es CONTEXTO descriptivo; NO es fuente de evidencia de eficacia terapéutica.
+- Si «calibracion_sintesis.retrieval_confidence» < 0.5, evita tono de certeza absoluta en la síntesis final.
+- Si «nota_procedencia_recuperacion» está presente en una cita, inclúyela al inicio del bloque ### PMID.
+
 REGLAS ABSOLUTAS:
 - Usa ÚNICAMENTE el JSON del mensaje del usuario; no recibes ni debes reproducir otro borrador.
 - PROHIBIDO copiar listas tipo «Hallazgos clave», «Referencias PubMed», extractos entre comillas
@@ -78,6 +89,14 @@ REGLAS ABSOLUTAS:
 - No uses tablas markdown; párrafos y viñetas simples bajo cada sección ##.
 - Salida: solo las dos secciones ## (sin prefacio tipo "Aquí tienes")."""
 
+
+from app.capabilities.evidence_rag.clinical_knowledge import landmark_synthesis_hint  # noqa: E402
+from app.capabilities.evidence_rag.retrieval_tiers import tier_retrieval_provenance_line  # noqa: E402
+from app.orchestration.synthesis_calibration import (  # noqa: E402
+    SynthesisCalibration,
+    calibration_from_state,
+    tier_aware_evidence_leadin,
+)
 
 def synthesis_uses_llm() -> bool:
     """``True`` si ``COPILOT_SYNTHESIS=llm`` y hay ``LLM_BASE_URL`` + ``LLM_MODEL``."""
@@ -152,7 +171,6 @@ def _compact_facts_json(state: Dict[str, Any], medical_answer: Dict[str, Any]) -
     if len(pubmed_q) > 400:
         pubmed_q = pubmed_q[:397].rstrip() + "…"
 
-    cite_rows: list[dict[str, Any]] = []
     by_pmid_snip: dict[str, str] = {}
     eb0 = state.get("evidence_bundle")
     if isinstance(eb0, dict):
@@ -184,6 +202,15 @@ def _compact_facts_json(state: Dict[str, Any], medical_answer: Dict[str, Any]) -
             title_c = (str(c.get("title") or "").strip())[:150]
             snip_c = (by_pmid_snip.get(pm, "")[:350])
             ep = infer_epistemic_profile(title_c, snip_c, intent=clinical_intent)
+            
+            # Buscar info de la etapa (incluyendo el tier) en el objeto article completo original (desde evidence_bundle)
+            art_obj = {}
+            if isinstance(eb_align, dict):
+                art_obj = next((ar for ar in (eb_align.get("articles") or []) if isinstance(ar, dict) and str(ar.get("pmid") or "").strip() == pm), {})
+            tier_val = art_obj.get("retrieval_tier") or 99
+            stage_str = art_obj.get("retrieval_stage") or "primary"
+            prov_line = tier_retrieval_provenance_line(int(tier_val), str(stage_str))
+
             row: dict[str, Any] = {
                 "pmid": pm,
                 "title": title_c,
@@ -194,8 +221,17 @@ def _compact_facts_json(state: Dict[str, Any], medical_answer: Dict[str, Any]) -
                     "preclinical",
                 ),
                 "puede_afirmar_eficacia_clinica_directa": ep.evidence_type
-                in ("rct", "meta_analysis", "guideline", "target_trial"),
+                in ("rct", "meta_analysis", "guideline", "target_trial")
+                and int(tier_val) <= 3,
+                "nivel_epistemico_busqueda": tier_val,
+                "fase_recuperacion": stage_str,
+                "nota_procedencia_recuperacion": prov_line,
             }
+            
+            hint = landmark_synthesis_hint(title_c, snip_c)
+            if hint:
+                row["landmark_conocido"] = hint
+                
             if pm in align_by_pmid:
                 row["alineacion_clinica"] = align_by_pmid[pm]
             cite_rows.append(row)
@@ -209,6 +245,9 @@ def _compact_facts_json(state: Dict[str, Any], medical_answer: Dict[str, Any]) -
 
     summary_sql = (str(medical_answer.get("summary") or "").strip())[:480]
     asks_comparison = question_requests_direct_therapeutic_comparison(uq)
+
+    cal = calibration_from_state(state)
+    cal_dict: dict[str, Any] | None = cal.to_dict() if cal else None
 
     facts: dict[str, Any] = {
         "pregunta_usuario": uq,
@@ -237,6 +276,8 @@ def _compact_facts_json(state: Dict[str, Any], medical_answer: Dict[str, Any]) -
             if str(x).strip()
         ],
         "citas_pubmed": cite_rows,
+        "calibracion_sintesis": cal_dict,
+        "cohorte_local_solo_contexto": route in ("hybrid", "sql"),
     }
 
     return json.dumps(facts, ensure_ascii=False, indent=2)
@@ -359,8 +400,12 @@ def try_llm_synthesis_narrative(
         return None, warns
 
     text = dedupe_pmid_sections(text)
+    text = _inject_tier_provenance_in_pmid_sections(text, facts_json)
     text = _sanitize_no_evidence_claim(text, medical_answer)
     text = _sanitize_extrapolated_efficacy(text, facts_json)
+    cal = calibration_from_state(state)
+    if cal is not None:
+        text = _sanitize_overconfident_synthesis(text, cal)
     if len(text) > 14_000:
         text = text[:13_997].rstrip() + "…"
     return text, warns
@@ -417,6 +462,80 @@ def _sanitize_extrapolated_efficacy(text: str, facts_json: str) -> str:
         return replacement
 
     return _EFFICACY_EXTRAPOLATION.sub(_repl, text, count=3)
+
+
+_OVERCONFIDENT_PATTERNS = re.compile(
+    r"(demuestra|demostró|reduce\s+de\s+forma\s+significativa|"
+    r"superioridad\s+clara|eficacia\s+comprobada|evidencia\s+contundente)",
+    re.I,
+)
+
+
+def _sanitize_overconfident_synthesis(text: str, cal: SynthesisCalibration) -> str:
+    """Atenúa lenguaje de certeza cuando la calibración indica recuperación débil o tier alto."""
+    if cal.retrieval_confidence >= 0.5 and cal.dominant_retrieval_tier < 3:
+        return text
+    caveat = (
+        " (Nota: la recuperación bibliográfica fue parcial o de baja especificidad; "
+        "formulación prudente recomendada.)"
+    )
+
+    def _repl(m: re.Match[str]) -> str:
+        return m.group(0) + caveat
+
+    return _OVERCONFIDENT_PATTERNS.sub(_repl, text, count=2)
+
+
+def _inject_tier_provenance_in_pmid_sections(text: str, facts_json: str) -> str:
+    """Inserta nota de procedencia bajo cada ### PMID si tier > 1 y el modelo no la puso."""
+    try:
+        facts = json.loads(facts_json)
+    except json.JSONDecodeError:
+        return text
+    cites = facts.get("citas_pubmed") or []
+    if not isinstance(cites, list):
+        return text
+    out = text
+    for c in cites:
+        if not isinstance(c, dict):
+            continue
+        pm = str(c.get("pmid") or "").strip()
+        note = c.get("nota_procedencia_recuperacion")
+        if not pm or not isinstance(note, str) or not note.strip():
+            continue
+        if note in out:
+            continue
+        pat = re.compile(
+            rf"(^### PMID {re.escape(pm)}\b[^\n]*\n)(?!\*Recuperado)",
+            re.MULTILINE,
+        )
+        out = pat.sub(rf"\1{note.strip()}\n\n", out, count=1)
+    return out
+
+
+def apply_tier_aware_evidence_summary(
+    medical_answer: Dict[str, Any],
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Prefija evidence_summary con párrafo determinista si la calibración lo exige."""
+    cal = calibration_from_state(state)
+    if cal is None:
+        return medical_answer
+    lead = tier_aware_evidence_leadin(cal)
+    if not lead:
+        return medical_answer
+    out = dict(medical_answer)
+    es = (out.get("evidence_summary") or "").strip()
+    if lead not in es:
+        out["evidence_summary"] = f"{lead}\n\n{es}".strip() if es else lead
+    un = list(out.get("uncertainty_notes") or [])
+    if not any("Calibración" in str(x) for x in un):
+        un.append(
+            f"Calibración: confianza recuperación={cal.retrieval_confidence:.2f}, "
+            f"tier dominante={cal.dominant_retrieval_tier}, outcome={cal.retrieval_outcome}."
+        )
+    out["uncertainty_notes"] = un
+    return out
 
 
 def _sanitize_no_evidence_claim(text: str, medical_answer: Dict[str, Any]) -> str:

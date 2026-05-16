@@ -19,7 +19,11 @@ from app.capabilities.evidence_rag.clinical_alignment import (
     alignment_composite,
     score_paper_alignment,
 )
-from app.capabilities.evidence_rag.clinical_knowledge import landmark_rerank_boost
+from app.capabilities.evidence_rag.clinical_knowledge import (
+    landmark_rerank_boost,
+    match_diabetes_cvot_landmark,
+    match_landmark_trial,
+)
 from app.capabilities.evidence_rag.clinical_intent import ClinicalIntent, intent_asks_cv_outcomes
 from app.capabilities.evidence_rag.population_context_alignment import (
     niche_applicability_limitada_line,
@@ -27,7 +31,9 @@ from app.capabilities.evidence_rag.population_context_alignment import (
 )
 from app.capabilities.evidence_rag.intent_semantic_query import build_intent_semantic_query
 from app.capabilities.evidence_rag.semantic_config import semantic_rerank_mode
+from app.capabilities.evidence_rag.applicability_scoring import calculate_applicability
 from app.capabilities.evidence_rag.epistemic_ranking import finalize_rank_score
+from app.capabilities.evidence_rag.retrieval_tiers import tier_weight_multiplier
 from app.capabilities.evidence_rag.semantic_ranking import semantic_rank_articles
 
 _STOP = frozenset(
@@ -503,11 +509,28 @@ def composite_relevance_score(
         population_medications=population_medications or [],
     )
     recency = max(0.0, 0.06 - position_index * 0.01)
+    cv_ask = clinical_intent is not None and intent_asks_cv_outcomes(clinical_intent)
+    tangential_pen = 0.0
+    if cv_ask:
+        blob = _fold(f"{title} {abstract_snippet}")
+        if re.search(r"\b(hfpef|hfref|heart failure phenotype)\b", blob, re.I) and not re.search(
+            r"\b(type\s*2\s*diabet|t2dm|diabetes\s*mellitus)\b", blob, re.I
+        ):
+            tangential_pen -= 0.22
+        if re.search(r"\bacute kidney injury\b|\baki\b", blob, re.I) and not re.search(
+            r"\b(mace|cardiovascular death|myocardial)\b", blob, re.I
+        ):
+            tangential_pen -= 0.18
+        if re.search(r"\bfibrosis\b|\bmechanistic\b", blob, re.I) and not re.search(
+            r"\b(mace|cvot|cardiovascular outcome)\b", blob, re.I
+        ):
+            tangential_pen -= 0.15
     align_term = 0.0
     if clinical_intent is not None:
         align_scores = score_paper_alignment(clinical_intent, title, abstract_snippet)
         axis = getattr(clinical_intent, "priority_axis", "intervention") or "intervention"
-        align_term = 0.38 * alignment_composite(
+        align_coef = 0.45 if cv_ask else 0.38
+        align_term = align_coef * alignment_composite(
             align_scores, priority_axis=axis, intent=clinical_intent
         )
     landmark = landmark_rerank_boost(
@@ -521,12 +544,52 @@ def composite_relevance_score(
         + clin
         + niche_pen
         + landmark
+        + tangential_pen
         - penalty
     )
     
     raw = max(0.01, raw * app_multiplier)
     
     return raw, app_line or "" 
+
+
+def _enforce_landmark_in_top_k(
+    ranked: list[dict[str, Any]],
+    pool: list[dict[str, Any]],
+    *,
+    cap: int,
+    clinical_intent: ClinicalIntent | None,
+) -> list[dict[str, Any]]:
+    """Si hay CVOT landmark en el pool pero ninguno en top-k, sustituye el peor del top."""
+    if not clinical_intent or not intent_asks_cv_outcomes(clinical_intent):
+        return ranked[:cap]
+    top = ranked[:cap]
+    if any(
+        match_diabetes_cvot_landmark(str(a.get("title") or ""), str(a.get("abstract_snippet") or ""))
+        for a in top
+    ):
+        return top
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    for a in pool:
+        tit = str(a.get("title") or "")
+        sn = str(a.get("abstract_snippet") or "")
+        if not match_diabetes_cvot_landmark(tit, sn):
+            continue
+        dbg = a.get("rank_score_debug") or {}
+        sc = float(dbg.get("fused") or dbg.get("fused_pre_epistemic") or 0.0)
+        tier = int(a.get("retrieval_tier") or 99)
+        sc += max(0.0, 0.15 * (5 - min(tier, 5)))
+        candidates.append((sc, a))
+    if not candidates:
+        return top
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best = candidates[0][1]
+    best_pm = str(best.get("pmid") or "").strip()
+    if not best_pm or any(str(x.get("pmid") or "").strip() == best_pm for x in top):
+        return top
+    if len(top) < cap:
+        return top + [best]
+    return top[:-1] + [best]
 
 
 def rerank_article_dicts(
@@ -575,6 +638,10 @@ def rerank_article_dicts(
             abstract=snip,
             clinical_intent=clinical_intent,
         )
+        tier_raw = a.get("retrieval_tier")
+        tw = tier_weight_multiplier(int(tier_raw) if tier_raw is not None else None)
+        sc = max(0.01, sc * tw)
+        rank_meta = {**rank_meta, "retrieval_tier": tier_raw, "tier_weight": round(tw, 4)}
         row = dict(a)
         row["rank_score_debug"] = rank_meta
         if clinical_intent is not None:
@@ -594,8 +661,9 @@ def rerank_article_dicts(
         )
         for art in out:
             art["semantic_ranking_debug"] = sem_dbg
-        return out
+        return _enforce_landmark_in_top_k(out, enriched, cap=cap, clinical_intent=clinical_intent)
 
     pairs = list(zip(heuristic_scores, enriched))
     pairs.sort(key=lambda x: x[0], reverse=True)
-    return [a for _, a in pairs[: max(1, cap)]]
+    ordered = [a for _, a in pairs]
+    return _enforce_landmark_in_top_k(ordered, enriched, cap=cap, clinical_intent=clinical_intent)

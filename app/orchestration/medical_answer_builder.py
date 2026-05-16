@@ -419,42 +419,54 @@ def build_stub_medical_answer(state: Dict[str, Any]) -> Dict[str, Any]:
             "Reformular la pregunta o ampliar criterios de búsqueda si no hubo artículos recuperados."
         )
 
+    local_cohort_block: str | None = None
+    if route in (Route.SQL, Route.HYBRID):
+        if cohort_n == 0 and route == Route.HYBRID and arts:
+            local_cohort_block = (
+                "Cohorte local (SQL): 0 pacientes con los criterios aplicados en la base disponible. "
+                "Esto refleja filtros estrictos y/o tamaño de la BD; no implica ausencia de literatura "
+                "sobre la pregunta clínica."
+            )
+        elif cohort_n is not None:
+            local_cohort_block = (
+                f"Cohorte local (SQL): {cohort_n} paciente(s) acotados a la consulta "
+                "(contexto descriptivo; no es evidencia de eficacia terapéutica)."
+            )
+        elif cohort_summary:
+            local_cohort_block = cohort_summary.strip()
+        elif sql_r:
+            local_cohort_block = _cohort_summary_sql_only(sql_r, cohort_n)
+
+    external_evidence_block: str | None = evidence_summary
+
     summary_parts: list[str] = []
-    if cohort_n == 0 and route == Route.HYBRID and arts:
+    if route == Route.HYBRID and arts:
         summary_parts.append(
-            f"La cohorte local con los criterios aplicados (SQL) contabiliza 0 pacientes "
-            f"en la base de datos disponible. Esto refleja criterios combinados estrictos "
-            f"y/o el tamaño de la BD, no implica ausencia de evidencia científica sobre "
-            f"esta población: se recuperaron {len(arts)} referencia(s) en PubMed que sí "
-            f"abordan la pregunta y se analizan a continuación."
+            "Consulta híbrida: datos locales (cohorte) y evidencia bibliográfica PubMed se presentan "
+            "por separado; la eficacia terapéutica debe inferirse solo de la literatura recuperada."
         )
-    elif cohort_n is not None:
-        summary_parts.append(
-            f"En la cohorte local se identificaron {cohort_n} pacientes acotados a la consulta."
-        )
-    elif cohort_summary and route == Route.HYBRID:
-        summary_parts.append(
-            "La consulta se orientó a cohorte local y evidencia científica (ver detalles estructurados)."
-        )
-    # ``evidence_summary`` no se concatena aquí: ``render_medical_answer_to_text`` ya añade la sección «Evidencia».
-    if route == Route.EVIDENCE and not arts:
+    elif route == Route.EVIDENCE and not arts:
         summary_parts.append(
             "Consulta orientada a evidencia científica; no se recuperaron artículos en este turno."
         )
+    elif route == Route.EVIDENCE and arts:
+        summary_parts.append(
+            "Consulta orientada a evidencia en PubMed (ver sección de literatura)."
+        )
+    elif route == Route.SQL and cohort_n is not None:
+        summary_parts.append(
+            f"Consulta orientada a datos locales: {cohort_n} paciente(s) en cohorte filtrada."
+        )
     if not summary_parts:
-        if evidence_summary and arts:
-            summary_parts.append(
-                "Consulta orientada a evidencia en PubMed; el detalle de la petición y los extractos "
-                "figuran en la sección «Evidencia»."
-            )
-        else:
-            summary_parts.append(
-                "Respuesta generada sin conteo de cohorte ni referencias recuperadas en este turno."
-            )
+        summary_parts.append(
+            "Respuesta generada sin conteo de cohorte ni referencias recuperadas en este turno."
+        )
     summary = " ".join(summary_parts).strip()
 
     result: Dict[str, Any] = {
         "summary": summary,
+        "local_cohort_block": local_cohort_block,
+        "external_evidence_block": external_evidence_block,
         "cohort_summary": cohort_summary,
         "evidence_summary": evidence_summary,
         "cohort_size": cohort_n,
@@ -498,12 +510,16 @@ def render_medical_answer_to_text(answer: Dict[str, Any]) -> str:
     s = (answer.get("summary") or "").strip()
     if s:
         blocks.append(s)
-    cs = answer.get("cohort_summary")
-    if isinstance(cs, str) and cs.strip():
-        blocks.append("Cohorte local\n" + cs.strip())
-    es = answer.get("evidence_summary")
-    if isinstance(es, str) and es.strip():
-        blocks.append("Evidencia\n" + es.strip())
+    lcb = answer.get("local_cohort_block")
+    if isinstance(lcb, str) and lcb.strip():
+        blocks.append("## Cohorte local\n" + lcb.strip())
+    elif (cs := answer.get("cohort_summary")) and isinstance(cs, str) and cs.strip():
+        blocks.append("## Cohorte local\n" + cs.strip())
+    eeb = answer.get("external_evidence_block")
+    if isinstance(eeb, str) and eeb.strip():
+        blocks.append("## Evidencia PubMed\n" + eeb.strip())
+    elif (es := answer.get("evidence_summary")) and isinstance(es, str) and es.strip():
+        blocks.append("## Evidencia PubMed\n" + es.strip())
     kf = answer.get("key_findings") or []
     if isinstance(kf, list) and kf:
         lines = "\n".join(f"• {str(x).strip()}" for x in kf if str(x).strip())

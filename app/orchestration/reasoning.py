@@ -30,6 +30,7 @@ class ReasoningState:
     conflicts: list[str] = field(default_factory=list)
     applicability_notes: list[str] = field(default_factory=list)
     evidence_quality: str | None = None
+    synthesis_calibration: dict[str, Any] | None = None
 
 
 def reasoning_state_to_dict(rs: ReasoningState) -> dict[str, Any]:
@@ -242,11 +243,18 @@ def build_reasoning_state(state: dict[str, Any]) -> ReasoningState:
                 f"{par_n} referencia(s) con trasladabilidad parcial frente al perfil de cohorte; "
                 "verificar criterios de inclusión en el abstract."
             )
+            
+    rd_check = eb.get("retrieval_debug") if isinstance(eb, dict) else None
+    if isinstance(rd_check, dict) and rd_check.get("outcome") == "partial_primary_miss":
+        notes.append(
+            "La recuperación principal estricta no obtuvo resultados. "
+            "Se amplió la métrica apoyándose en etapas adicionales (ej. ensayos clínicos clásicos o relajación de términos)."
+        )
 
     if expects_evidence:
         if not arts and not pmids:
             rd = eb.get("retrieval_debug") if isinstance(eb, dict) else None
-            if isinstance(rd, dict) and rd.get("outcome") and str(rd.get("outcome")) != "success":
+            if isinstance(rd, dict) and rd.get("outcome") and str(rd.get("outcome")) not in ("success", "partial_primary_miss"):
                 eq = str(rd["outcome"])
             elif pq:
                 eq = "sin_resultados_pubmed"
@@ -265,6 +273,25 @@ def build_reasoning_state(state: dict[str, Any]) -> ReasoningState:
     else:
         eq = None
 
+    from app.orchestration.synthesis_calibration import calibration_from_state
+
+    cal = calibration_from_state(state)
+    cal_dict: dict[str, Any] | None = cal.to_dict() if cal else None
+    if cal is not None:
+        cal_line = (
+            f"Calibración síntesis: confianza recuperación={cal.retrieval_confidence:.2f}, "
+            f"tier dominante={cal.dominant_retrieval_tier}, outcome={cal.retrieval_outcome}."
+        )
+        if cal_line not in notes:
+            notes.append(cal_line)
+        if cal.retrieval_confidence < 0.5 and cal.dominant_retrieval_tier >= 3:
+            weak = (
+                "Evidencia recuperada con baja confianza o tier epistémico alto (≥3); "
+                "evitar conclusiones de eficacia directa sin revisar abstracts."
+            )
+            if weak not in notes:
+                notes.append(weak)
+
     return ReasoningState(
         cohort_summary=cohort_text,
         evidence_assessments=assessments,
@@ -272,4 +299,5 @@ def build_reasoning_state(state: dict[str, Any]) -> ReasoningState:
         conflicts=conflicts,
         applicability_notes=appl_notes,
         evidence_quality=eq,
+        synthesis_calibration=cal_dict,
     )

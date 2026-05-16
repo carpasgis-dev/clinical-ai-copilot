@@ -106,3 +106,74 @@ def test_reasoning_evidence_assessment_applicability_with_elderly_cohort() -> No
     assert rs.evidence_assessments[0].applicability
     assert rs.evidence_assessments[0].applicability.startswith("Limitada")
     assert rs.applicability_notes
+
+
+def test_reasoning_includes_synthesis_calibration_from_state() -> None:
+    """``build_reasoning_state`` propaga calibración calculada en el nodo previo."""
+    state = {
+        "route": Route.HYBRID,
+        "sql_result": {"rows": [{"cohort_size": 2}]},
+        "clinical_context": {"population_conditions": ["diabetes"]},
+        "synthesis_calibration": {
+            "retrieval_outcome": "partial_primary_miss",
+            "dominant_retrieval_tier": 4,
+            "retrieval_confidence": 0.35,
+            "evidence_specificity": 0.2,
+            "applicability_confidence": 0.5,
+            "primary_stage_hit": False,
+            "landmark_present": False,
+        },
+        "evidence_bundle": EvidenceBundle(
+            search_term="x",
+            pmids=["111"],
+            articles=[
+                {
+                    "pmid": "111",
+                    "title": "SGLT2 inhibitors cardiovascular outcomes review",
+                    "abstract_snippet": "MACE cardiovascular mortality",
+                    "retrieval_tier": 4,
+                    "retrieval_stage": "broad_relaxed",
+                },
+            ],
+        ).model_dump(),
+    }
+    rs = build_reasoning_state(state)
+    assert rs.synthesis_calibration is not None
+    assert rs.synthesis_calibration["retrieval_outcome"] == "partial_primary_miss"
+    assert rs.synthesis_calibration["dominant_retrieval_tier"] == 4
+    assert any("Calibración síntesis" in n for n in rs.uncertainty_notes)
+    assert any("baja confianza" in n.lower() for n in rs.uncertainty_notes)
+
+
+def test_query_response_reasoning_exposes_synthesis_calibration() -> None:
+    from app.api.response_format import build_query_response
+
+    state = {
+        "route": "hybrid",
+        "route_reason": "test",
+        "final_answer": "ok",
+        "reasoning_state": {
+            "cohort_summary": "n≈2",
+            "evidence_assessments": [],
+            "uncertainty_notes": [],
+            "conflicts": [],
+            "applicability_notes": [],
+            "evidence_quality": "mixta",
+            "synthesis_calibration": {
+                "retrieval_outcome": "success",
+                "dominant_retrieval_tier": 2,
+                "retrieval_confidence": 1.0,
+                "evidence_specificity": 0.8,
+                "applicability_confidence": 0.7,
+                "primary_stage_hit": True,
+                "landmark_present": True,
+            },
+        },
+    }
+    resp = build_query_response(state, session_id="test", latency_ms=1.0)
+    assert resp.reasoning_state is not None
+    cal = resp.reasoning_state.synthesis_calibration
+    assert cal is not None
+    assert cal.retrieval_outcome == "success"
+    assert cal.dominant_retrieval_tier == 2
+    assert cal.retrieval_confidence == 1.0

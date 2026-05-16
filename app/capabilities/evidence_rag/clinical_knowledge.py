@@ -148,6 +148,47 @@ def landmark_pubmed_acronyms_clause() -> str:
     return f"({' OR '.join(terms)})" if terms else ""
 
 
+# CVOT T2DM con desenlace CV (excluye HF puro tipo DAPA-HF / EMPEROR para no inundar el pool).
+_T2DM_CVOT_RETRIEVAL_ACRONYMS: tuple[str, ...] = (
+    "EMPA-REG OUTCOME",
+    "EMPA-REG",
+    "LEADER trial",
+    "DECLARE-TIMI 58",
+    "DECLARE-TIMI",
+    "CANVAS program",
+    "REWIND trial",
+    "SUSTAIN-6",
+    "CREDENCE trial",
+)
+
+
+def landmark_cvot_retrieval_clause() -> str:
+    """
+    Query PubMed T2: solo nombres de ensayos (sin fármacos sueltos ni AND de clases terapéuticas).
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+    for ac in _T2DM_CVOT_RETRIEVAL_ACRONYMS:
+        q = f'"{ac}"[tiab]' if (" " in ac or "-" in ac) else f"{ac}[tiab]"
+        if q.lower() not in seen:
+            seen.add(q.lower())
+            terms.append(q)
+    return f"({' OR '.join(terms)})" if terms else ""
+
+
+def match_diabetes_cvot_landmark(title: str, abstract_snippet: str = "") -> LandmarkTrial | None:
+    """Landmark T2DM/CVOT; excluye ensayos HF sin diabetes como ancla principal."""
+    trial = match_landmark_trial(title, abstract_snippet)
+    if trial is None:
+        return None
+    if trial.acronym in ("DAPA-HF", "EMPEROR-Reduced"):
+        return None
+    pop = (trial.population or "").lower()
+    if "diabetes" not in pop and trial.acronym in ("SELECT",):
+        return None
+    return trial
+
+
 def landmark_pubmed_drugs_clause() -> str:
     drugs: list[str] = []
     seen: set[str] = set()
@@ -171,12 +212,14 @@ def landmark_rerank_boost(
     """
     if clinical_intent is not None and not intent_asks_cv_outcomes(clinical_intent):
         return 0.0
-    trial = match_landmark_trial(title, abstract_snippet)
+    trial = match_diabetes_cvot_landmark(title, abstract_snippet) or match_landmark_trial(
+        title, abstract_snippet
+    )
     if not trial:
         return 0.0
     if trial.evidence_level == "rct_landmark":
-        return 0.18
-    return 0.10
+        return 0.28
+    return 0.14
 
 
 def landmark_synthesis_hint(title: str, abstract_snippet: str = "") -> str | None:

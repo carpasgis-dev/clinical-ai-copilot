@@ -421,6 +421,11 @@ def alignment_composite(
     else:
         w_pop, w_iv, w_out, w_comp = 0.22, 0.28, 0.28, 0.10
 
+    # Preguntas con desenlaces CV/MACE: subir peso de outcome aunque el eje prioritario sea intervención.
+    if intent and intent_asks_cv_outcomes(intent) and axis != "outcome":
+        w_out = max(w_out, 0.36)
+        w_iv = min(w_iv, 0.24)
+
     # Pregunta con comparador explícito (p. ej. vs metformina): más peso al comparador.
     if intent and intent.comparator:
         w_comp = max(w_comp, 0.14)

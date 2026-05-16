@@ -261,6 +261,14 @@ class MedicalAnswer(BaseModel):
         None,
         description="Resumen agregado de hallazgos bibliográficos cuando aplica.",
     )
+    local_cohort_block: Optional[str] = Field(
+        None,
+        description="Bloque narrativo de cohorte SQL (contexto local, no eficacia terapéutica).",
+    )
+    external_evidence_block: Optional[str] = Field(
+        None,
+        description="Bloque narrativo de evidencia PubMed externa.",
+    )
     cohort_size: Optional[int] = Field(
         None,
         description="Tamaño de cohorte local si el conteo SQL está disponible.",
@@ -304,6 +312,47 @@ class EvidenceAssessmentOut(BaseModel):
     applicability: Optional[str] = Field(None, description="Nota breve de aplicabilidad a la cohorte.")
 
 
+class SynthesisCalibrationOut(BaseModel):
+    """Calibración epistémica post-retrieval (tier, confianza, especificidad)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    retrieval_outcome: str = Field(
+        "pending",
+        description="success | partial_primary_miss | full_miss | zero_hits_all_stages | …",
+    )
+    dominant_retrieval_tier: int = Field(
+        99,
+        description="Peor tier epistémico en el top-N (1=PICO exacto … 5=mecanístico).",
+    )
+    retrieval_confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Confianza heurística en la calidad del pool recuperado.",
+    )
+    evidence_specificity: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Fracción de evidencia directa (outcome alto / landmark) en top-N.",
+    )
+    applicability_confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Media de puntuaciones de aplicabilidad en top-N.",
+    )
+    primary_stage_hit: bool = Field(
+        False,
+        description="True si algún artículo del top-N proviene de tier 1 (PICO exacto).",
+    )
+    landmark_present: bool = Field(
+        False,
+        description="True si hay ensayo landmark conocido en el top-N.",
+    )
+
+
 class ReasoningStateOut(BaseModel):
     """Estado de razonamiento clínico serializado (determinista, sin LLM en el builder)."""
 
@@ -325,22 +374,29 @@ class ReasoningStateOut(BaseModel):
         None,
         description="Calidad global de la evidencia recuperada (p. ej. mixta, sin_resultados_pubmed).",
     )
+    synthesis_calibration: Optional[SynthesisCalibrationOut] = Field(
+        None,
+        description="Señales de calibración para síntesis tier-aware y UI (post-retrieval).",
+    )
 
 
 class PubMedRetrievalAttemptOut(BaseModel):
     """Un intento de esearch/efetch/parse en la pipeline PubMed."""
 
     label: str = Field("", description="primary_pdat, fallback_no_pdat, fallback_shorter_boolean, …")
+    stage_id: Optional[str] = Field(None, description="Identificador de la etapa de orquestación.")
     query: str = Field("", description="Término enviado a ESearch en ese intento.")
     used_pdat: bool = Field(False, description="Si se aplicó filtro de fechas PDAT.")
     mindate: Optional[str] = Field(None, description="Límite inferior PDAT (YYYY/MM/DD).")
     maxdate: Optional[str] = Field(None, description="Límite superior PDAT.")
     result_count: Optional[int] = Field(None, description="Conteo total reportado por NCBI (si aplica).")
     idlist_length: int = Field(0, description="PMIDs devueltos en la página esearch.")
+    pmids_from_stage: Optional[List[str]] = Field(None, description="PMIDs finalmente extraídos de esta etapa.")
     http_status: Optional[int] = Field(None, description="Código HTTP de esearch.")
     stage_reached: str = Field("", description="esearch | efetch | parse")
     error: Optional[str] = Field(None, description="Mensaje de error del intento, si lo hubo.")
     articles_parsed: int = Field(0, description="Artículos parseados tras efetch en ese intento.")
+    articles_from_stage: Optional[int] = Field(None, description="Cantidad de artículos extraídos y agregados.")
 
 
 class PubMedNormalizationOut(BaseModel):

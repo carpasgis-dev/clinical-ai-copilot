@@ -29,9 +29,33 @@ def test_hero_broad_primary_stages_with_elderly() -> None:
     ids = [s.stage_id for s in stages]
     assert ids[0] == "broad_primary"
     assert "cvot_landmark" in ids
+    assert ids.index("cvot_landmark") < ids.index("broad_relaxed")
     q = stages[0].query.lower()
-    assert "aged" in q or "elderly" in q or "older adult" in q
-    assert q.count(" or ") <= 20
+    assert "diabetes mellitus" in q or "[mesh]" in q
+    assert "type2diabetes[tiab]" not in q.replace(" ", "")
+    assert q.count(" or ") <= 28
+
+
+def test_cvot_landmark_query_is_slim() -> None:
+    intent = extract_clinical_intent(_HERO)
+    from app.capabilities.evidence_rag.heuristic_evidence_query import build_cvot_landmark_query
+
+    lq = build_cvot_landmark_query(intent).lower()
+    assert "empa-reg" in lq
+    assert "declare-timi" in lq
+    assert "empagliflozin" not in lq
+    assert "semaglutide" not in lq
+    assert "sglt2" not in lq
+    assert "glucagon" not in lq
+    assert " and " not in lq
+
+
+def test_mesh_expands_type2_diabetes_phrase() -> None:
+    from app.capabilities.evidence_rag.mesh_lite import expand_cohort_token_for_pubmed
+
+    ph = expand_cohort_token_for_pubmed("type 2 diabetes")
+    assert "[Mesh]" in ph
+    assert "type2diabetes[tiab]" not in ph.replace(" ", "")
 
 
 def test_safety_intent_adds_adverse_events_block() -> None:
@@ -55,7 +79,7 @@ def test_hero_cv_intent_broad_query_has_core_axes() -> None:
     assert "sglt2" in q0 or "gliflozin" in q0
     assert "cardiovascular" in q0 or "mace" in q0
     assert "diabet" in q0 or "type 2 diabetes" in q0
-    assert q0.count(" or ") <= 20
+    assert q0.count(" or ") <= 28
 
 
 def test_cvot_trial_title_inference() -> None:

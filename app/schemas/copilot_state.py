@@ -251,6 +251,9 @@ class CopilotState(TypedDict, total=False):
     clinical_intent: dict[str, Any]
     """Intención clínica PICO-lite (``ClinicalIntent``) extraída para re-ranking y síntesis."""
 
+    synthesis_calibration: dict[str, Any]
+    """Calibración epistémica post-retrieval (``SynthesisCalibration.to_dict()``)."""
+
     reasoning_state: dict[str, Any]
     """Razonamiento clínico explícito (fase 3.7); JSON-serializable (``ReasoningState``)."""
 

@@ -12,12 +12,14 @@ from typing import Any
 from app.capabilities.contracts import ClinicalCapability, EvidenceCapability
 from app.capabilities.evidence_rag.copilot_errors import CopilotError
 from app.capabilities.evidence_rag.clinical_intent import extract_clinical_intent
+from app.capabilities.evidence_rag.evidence_pool_filter import filter_off_topic_abstracts
 from app.capabilities.evidence_rag.evidence_rerank import (
     clinical_weak_evidence_share,
     rerank_article_dicts,
 )
 from app.capabilities.evidence_rag.heuristic_evidence_query import (
     RetrievalStage,
+    as_clinical_context,
     build_evidence_retrieval_stages,
     build_evidence_search_queries,
     canonical_pubmed_query_after_retrieval,
@@ -82,16 +84,30 @@ def _step_pubmed_evidence_route(
 
 def _merge_bundle_articles(
     bundle: EvidenceBundle,
+    stage_id: str,
+    retrieval_tier: int,
     *,
     merged_arts: list[dict[str, Any]],
-    seen_pm: set[str],
+    seen_pm: dict[str, dict[str, Any]],
 ) -> None:
     for art in bundle.articles:
         d = art.model_dump(mode="json") if hasattr(art, "model_dump") else dict(art)
         pm = str(d.get("pmid") or "").strip()
-        if not pm or pm in seen_pm:
+        if not pm:
             continue
-        seen_pm.add(pm)
+            
+        if pm in seen_pm:
+            # Si ya existía, vemos si la nueva etapa tiene un mejor tier (menor número)
+            existing_art = seen_pm[pm]
+            current_tier = existing_art.get("retrieval_tier", 99)
+            if retrieval_tier < current_tier:
+                existing_art["retrieval_tier"] = retrieval_tier
+                existing_art["retrieval_stage"] = stage_id
+            continue
+            
+        d["retrieval_stage"] = stage_id
+        d["retrieval_tier"] = retrieval_tier
+        seen_pm[pm] = d
         merged_arts.append(d)
 
 
@@ -102,7 +118,7 @@ def _run_retrieval_stages_parallel(
     years_back: int,
     pool_max: int,
     merged_arts: list[dict[str, Any]],
-    seen_pm: set[str],
+    seen_pm: dict[str, dict[str, Any]],
     queries: list[str],
     stages_executed: list[dict[str, str]],
     primary_bundle_holder: list[EvidenceBundle | None],
@@ -139,10 +155,23 @@ def _run_retrieval_stages_parallel(
         q = (stage.query or "").strip()
         if primary_bundle_holder[0] is None:
             primary_bundle_holder[0] = bundle
-        stages_executed.append({"stage_id": stage.stage_id, "query": q})
+            
+        rd = bundle.retrieval_debug or {}
+        stages_executed.append({
+            "stage_id": stage.stage_id, 
+            "query": q,
+            "pmids": bundle.pmids,
+            "articles_count": len(bundle.articles),
+            "outcome": rd.get("outcome", "unknown"),
+            "raw_debug": rd
+        })
+        
         if q not in queries:
             queries.append(q)
-        _merge_bundle_articles(bundle, merged_arts=merged_arts, seen_pm=seen_pm)
+        
+        # Leemos el tier si está, sino fallback a 1
+        tier = getattr(stage, "retrieval_tier", 1)
+        _merge_bundle_articles(bundle, stage.stage_id, tier, merged_arts=merged_arts, seen_pm=seen_pm)
         if len(merged_arts) >= pool_max:
             break
 
@@ -154,7 +183,7 @@ def _run_retrieval_stage(
     years_back: int,
     pool_max: int,
     merged_arts: list[dict[str, Any]],
-    seen_pm: set[str],
+    seen_pm: dict[str, dict[str, Any]],
     queries: list[str],
     stages_executed: list[dict[str, str]],
     primary_bundle_holder: list[EvidenceBundle | None],
@@ -170,13 +199,31 @@ def _run_retrieval_stage(
     eff_years = (
         stage.years_back_override if stage.years_back_override is not None else years_back
     )
-    bundle = evidence.retrieve_evidence(q, retmax=retmax_this, years_back=eff_years)
+    refine_pubtypes = stage.stage_id not in ("cvot_landmark", "broad_relaxed")
+    bundle = evidence.retrieve_evidence(
+        q,
+        retmax=retmax_this,
+        years_back=eff_years,
+        synthesis_pubtype_refine=refine_pubtypes,
+    )
     if primary_bundle_holder[0] is None:
         primary_bundle_holder[0] = bundle
-    stages_executed.append({"stage_id": stage.stage_id, "query": q})
+        
+    rd = bundle.retrieval_debug or {}
+    stages_executed.append({
+        "stage_id": stage.stage_id, 
+        "query": q,
+        "pmids": bundle.pmids,
+        "articles_count": len(bundle.articles),
+        "outcome": rd.get("outcome", "unknown"),
+        "raw_debug": rd
+    })
+    
     if q not in queries:
         queries.append(q)
-    _merge_bundle_articles(bundle, merged_arts=merged_arts, seen_pm=seen_pm)
+    
+    tier = getattr(stage, "retrieval_tier", 1)
+    _merge_bundle_articles(bundle, stage.stage_id, tier, merged_arts=merged_arts, seen_pm=seen_pm)
 
 
 def _maybe_llm_refine_stage(
@@ -212,7 +259,16 @@ def _maybe_llm_refine_stage(
     )
     if primary_bundle_holder[0] is None:
         primary_bundle_holder[0] = bundle
-    stages_executed.append({"stage_id": "llm_refine", "query": llm_q})
+        
+    rd = bundle.retrieval_debug or {}
+    stages_executed.append({
+        "stage_id": "llm_refine", 
+        "query": llm_q,
+        "pmids": bundle.pmids,
+        "articles_count": len(bundle.articles),
+        "outcome": rd.get("outcome", "unknown"),
+        "raw_debug": rd
+    })
     queries.append(llm_q)
     _merge_bundle_articles(bundle, merged_arts=merged_arts, seen_pm=seen_pm)
     warn.append(
@@ -265,6 +321,51 @@ def _cohort_rerank_hints(
     return None, None, None
 
 
+def _aggregate_retrieval_debug(
+    original_rd: dict[str, Any] | None,
+    stages_executed: list[dict[str, Any]],
+    merged_arts: list[dict[str, Any]]
+) -> dict[str, Any]:
+    out = dict(original_rd) if original_rd else {}
+    
+    total_pmids = len(merged_arts)
+    if total_pmids == 0:
+        outcome = "zero_hits_all_stages"
+    else:
+        # Check if the primary stage got PMIDs
+        if stages_executed and not stages_executed[0].get("pmids"):
+            outcome = "partial_primary_miss"
+        else:
+            outcome = "success"
+            
+    out["outcome"] = outcome
+    
+    # Merge attempts from all stages
+    all_attempts = []
+    all_errors = []
+    
+    for s_exec in stages_executed:
+        raw_db = s_exec.get("raw_debug") or {}
+        st_attempts = raw_db.get("attempts", [])
+        st_errors = raw_db.get("errors", [])
+        
+        # Inject stage_id and pmids fetched into attempts
+        for att in st_attempts:
+            att_copy = dict(att)
+            att_copy["stage_id"] = s_exec.get("stage_id")
+            att_copy["pmids_from_stage"] = s_exec.get("pmids", [])
+            att_copy["articles_from_stage"] = s_exec.get("articles_count", 0)
+            all_attempts.append(att_copy)
+            
+        all_errors.extend(st_errors)
+        
+    out["attempts"] = all_attempts
+    # Remove duplicates from errors
+    out["errors"] = list(dict.fromkeys(all_errors))
+    
+    return out
+
+
 def _step_evidence_retrieve(
     work: dict[str, Any],
     evidence: EvidenceCapability,
@@ -299,9 +400,12 @@ def _step_evidence_retrieve(
     stages_executed: list[dict[str, str]] = []
     pool_max = settings.evidence_retrieval_pool_max
     merged_arts: list[dict[str, Any]] = []
-    seen_pm: set[str] = set()
+    seen_pm: dict[str, dict[str, Any]] = {}
     primary_holder: list[EvidenceBundle | None] = [None]
-    use_parallel = parallel_retrieval_enabled() and len(stage_plan) > 1
+    
+    # Desactivamos paralelo si el plan es en escalera (ladder) e incluye fallbacks o múltiples roles
+    has_ladder_logic = any(getattr(s, "stage_role", "primary") != "primary" for s in stage_plan)
+    use_parallel = parallel_retrieval_enabled() and len(stage_plan) > 1 and not has_ladder_logic
 
     if use_parallel:
         _run_retrieval_stages_parallel(
@@ -320,11 +424,8 @@ def _step_evidence_retrieve(
             "etapas PubMed/Europe PMC en concurrente."
         )
     else:
-        executed_ids: set[str] = set()
+        # Bucle único por stage_plan ordenado (Ladder)
         for stage in stage_plan:
-            if stage.stage_id == "cvot_landmark":
-                continue
-            before = len(merged_arts)
             _run_retrieval_stage(
                 stage,
                 evidence=evidence,
@@ -336,31 +437,13 @@ def _step_evidence_retrieve(
                 stages_executed=stages_executed,
                 primary_bundle_holder=primary_holder,
             )
-            if stage.stage_id:
-                executed_ids.add(stage.stage_id)
+            
+            # Cortamos si esta etapa llenó la cuota solicitada
             if (
                 stage.stop_after_if_pmids_at_least is not None
                 and len(merged_arts) >= stage.stop_after_if_pmids_at_least
-                and len(merged_arts) > before
             ):
                 break
-
-        _SUPPLEMENTAL_STAGE_IDS = frozenset({"cvot_landmark", "cv_evidence_hierarchy"})
-        for stage in stage_plan:
-            if stage.stage_id not in _SUPPLEMENTAL_STAGE_IDS or stage.stage_id in executed_ids:
-                continue
-            _run_retrieval_stage(
-                stage,
-                evidence=evidence,
-                years_back=years_back,
-                pool_max=pool_max,
-                merged_arts=merged_arts,
-                seen_pm=seen_pm,
-                queries=queries,
-                stages_executed=stages_executed,
-                primary_bundle_holder=primary_holder,
-            )
-            executed_ids.add(stage.stage_id)
 
     _maybe_llm_refine_stage(
         evidence=evidence,
@@ -392,8 +475,8 @@ def _step_evidence_retrieve(
     )
     if len(queries) > 1 or adaptive:
         rd = bd.get("retrieval_debug")
+        rd = _aggregate_retrieval_debug(rd if isinstance(rd, dict) else {}, stages_executed, merged_arts)
         if isinstance(rd, dict):
-            rd = dict(rd)
             rd["multi_stage_queries"] = queries
             rd["pubmed_pre_rerank_pool_max"] = pool_max
             rd["pubmed_candidates_merged"] = len(merged_arts)
@@ -423,8 +506,15 @@ def _step_evidence_retrieve(
         intent = extract_clinical_intent(uq, work.get("clinical_context"))
         clinical_intent_dict = intent.to_dict()
         clinical_ctx = as_clinical_context(work.get("clinical_context"))
+        
+        # Filtro de purificación PRE-Rerank: quitamos basura ontológica obvia
+        clean_arts = filter_off_topic_abstracts([a for a in raw_arts if isinstance(a, dict)], intent)
+        raw_arts_filtered_count = len(raw_arts) - len(clean_arts)
+        if raw_arts_filtered_count > 0:
+            warn.append(f"evidence: filtro pre-rerank excluyó {raw_arts_filtered_count} artículos no relacionados al dominio clínico central.")
+        
         ranked = rerank_article_dicts(
-            [a for a in raw_arts if isinstance(a, dict)],
+            clean_arts,
             uq,
             cap=6,
             population_age_min=amin,

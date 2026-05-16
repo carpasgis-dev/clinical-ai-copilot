@@ -531,7 +531,9 @@ def synthesis_stub_node(state: CopilotState) -> dict[str, Any]:
     Con ``COPILOT_SYNTHESIS=llm``, ``final_answer`` es solo la narrativa del LLM si tiene éxito;
     si falla, se usa el render determinista de ``MedicalAnswer``.
     """
-    ma = build_stub_medical_answer(state)
+    from app.orchestration.llm_synthesis import apply_tier_aware_evidence_summary
+
+    ma = apply_tier_aware_evidence_summary(build_stub_medical_answer(state), state)
     draft = render_medical_answer_to_text(ma)
     trace_summary = "deterministic MedicalAnswer (structured source of truth)"
     extra_warns: list[str] = []
@@ -625,3 +627,11 @@ def reasoning_node(state: CopilotState) -> dict[str, Any]:
             "ReasoningState determinista (cohorte + evidencia + aplicabilidad)",
         ),
     }
+
+
+def synthesis_calibration_node(state: dict[str, Any]) -> dict[str, Any]:
+    """Calcula la calibración de la síntesis y la añade al estado."""
+    from app.orchestration.synthesis_calibration import calculate_synthesis_calibration
+
+    calibration = calculate_synthesis_calibration(state)
+    return {"synthesis_calibration": calibration.to_dict()}
