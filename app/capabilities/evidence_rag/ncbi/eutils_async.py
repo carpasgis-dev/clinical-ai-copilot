@@ -100,6 +100,26 @@ async def esearch_pubmed_detailed_async(
             out["result_count"] = int(str(cnt))
         ids = res.get("idlist") or []
         out["idlist"] = [str(x) for x in ids]
+        
+        # INTRA-STAGE FALLBACK: Bypass year limits if 0 hits
+        if not out["idlist"] and datetype == "pdat":
+            fallback_params = params.copy()
+            for k in ("datetype", "mindate", "maxdate"):
+                fallback_params.pop(k, None)
+            
+            try:
+                r_fall = await client.get(url, params=fallback_params)
+                if r_fall.status_code < 400:
+                    data_fall = r_fall.json()
+                    res_fall = data_fall.get("esearchresult") or {}
+                    if not (res_fall.get("ERROR") or res_fall.get("ErrorMsg")):
+                        fall_ids = res_fall.get("idlist") or []
+                        out["idlist"] = [str(x) for x in fall_ids]
+                        if "count" in res_fall and str(res_fall["count"]).isdigit():
+                            out["result_count"] = int(str(res_fall["count"]))
+            except Exception:
+                pass
+                
     except httpx.TimeoutException as exc:
         out["error"] = f"timeout esearch: {exc}"
     except httpx.HTTPStatusError as exc:
@@ -406,6 +426,7 @@ def search_and_fetch_parallel_aware(
     *,
     retmax: int = 8,
     pubmed_years_back: Optional[int] = None,
+    synthesis_pubtype_refine: bool = True,
 ) -> Tuple[List[PubMedArticleRecord], dict[str, Any]]:
     """Usa async HTTP si el modo paralelo está activo; si no, delega en sync."""
     from app.capabilities.evidence_rag.retrieval_parallel import (
@@ -419,10 +440,12 @@ def search_and_fetch_parallel_aware(
                 term,
                 retmax=retmax,
                 pubmed_years_back=pubmed_years_back,
+                synthesis_pubtype_refine=synthesis_pubtype_refine,
             )
         )
     return search_and_fetch_with_debug(
         term,
         retmax=retmax,
         pubmed_years_back=pubmed_years_back,
+        synthesis_pubtype_refine=synthesis_pubtype_refine,
     )

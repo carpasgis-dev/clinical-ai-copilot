@@ -46,6 +46,8 @@ class NcbiEvidenceCapability:
         pubmed_query: str,
         retmax: int = 6,
         years_back: int = 5,
+        *,
+        synthesis_pubtype_refine: bool = True,
     ) -> EvidenceBundle:
         term = (pubmed_query or "").strip()
         if not term:
@@ -77,6 +79,7 @@ class NcbiEvidenceCapability:
             term,
             retmax=fetch_cap,
             pubmed_years_back=yb,
+            synthesis_pubtype_refine=synthesis_pubtype_refine,
         )
 
         articles: list[ArticleSummary] = []

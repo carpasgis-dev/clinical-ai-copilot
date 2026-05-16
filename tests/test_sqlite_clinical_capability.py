@@ -37,6 +37,56 @@ def test_sqlite_get_table_columns(tmp_path) -> None:
     assert "id" in cols and "birthdate" in cols
 
 
+def test_sqlite_rejects_unknown_table(tmp_path) -> None:
+    db = tmp_path / "demo.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE patients (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    cap = SqliteClinicalCapability(db_path=str(db))
+    r = cap.run_safe_query("SELECT id FROM secret_table")
+    assert r.error
+    assert "no permitida" in r.error.lower()
+
+
+def test_sqlite_rejects_sqlite_master(tmp_path) -> None:
+    db = tmp_path / "demo.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE patients (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    cap = SqliteClinicalCapability(db_path=str(db))
+    r = cap.run_safe_query("SELECT name FROM sqlite_master")
+    assert r.error
+    assert "sistema" in r.error.lower() or "no permitida" in r.error.lower()
+
+
+def test_sqlite_honors_limit_with_parens(tmp_path) -> None:
+    db = tmp_path / "demo.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE patients (id INTEGER PRIMARY KEY, name TEXT)")
+    for i in range(5):
+        conn.execute("INSERT INTO patients (name) VALUES (?)", (f"P{i}",))
+    conn.commit()
+    conn.close()
+    cap = SqliteClinicalCapability(db_path=str(db))
+    r = cap.run_safe_query("SELECT name FROM patients LIMIT (3)")
+    assert r.error is None
+    assert r.row_count == 3
+
+
+def test_sqlite_rejects_non_literal_limit(tmp_path) -> None:
+    db = tmp_path / "demo.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("CREATE TABLE patients (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+    cap = SqliteClinicalCapability(db_path=str(db))
+    r = cap.run_safe_query("SELECT id FROM patients LIMIT (SELECT 1)")
+    assert r.error
+    assert "limit" in r.error.lower()
+
+
 def test_sqlite_rejects_write(tmp_path) -> None:
     db = tmp_path / "x.db"
     c = sqlite3.connect(str(db))

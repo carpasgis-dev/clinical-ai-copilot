@@ -13,15 +13,74 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Optional
 
-from app.schemas.copilot_state import ClinicalContext, SqlResult, _CLINICAL_MAX_LIST, _SQL_MAX_ROWS
+import sqlglot
+from sqlglot import exp
+
+from app.schemas.copilot_state import ClinicalContext, SqlResult
+from app.config.settings import settings
 
 
-_FORBIDDEN = re.compile(
-    r"\b(insert|update|delete|drop|create|alter|attach|detach|pragma|replace|truncate)\b",
-    re.I,
-)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+_SYSTEM_TABLES = frozenset({"sqlite_master", "sqlite_schema"})
+
+
+def _cte_aliases(ast: exp.Expression) -> set[str]:
+    """Nombres de CTE declarados en WITH (referencias permitidas aunque no estén en list_tables)."""
+    aliases: set[str] = set()
+    with_nodes: list[exp.With] = []
+    if isinstance(ast, exp.With):
+        with_nodes.append(ast)
+    if isinstance(ast, exp.Select):
+        wc = ast.args.get("with")
+        if isinstance(wc, exp.With):
+            with_nodes.append(wc)
+    for wn in with_nodes:
+        for cte in wn.expressions:
+            alias = cte.alias
+            if alias:
+                aliases.add(str(alias).lower())
+    return aliases
+
+
+def _select_body(ast: exp.Expression) -> exp.Select | None:
+    if isinstance(ast, exp.With) and isinstance(ast.this, exp.Select):
+        return ast.this
+    if isinstance(ast, exp.Select):
+        return ast
+    return None
+
+
+def _extract_sql_positive_int(node: exp.Expression | None) -> int | None:
+    """Entero positivo desde Literal, Paren o Cast (formas habituales de LIMIT en sqlglot)."""
+    if node is None:
+        return None
+    if isinstance(node, exp.Literal):
+        raw = node.this
+        if isinstance(raw, bool):
+            return None
+        if isinstance(raw, int):
+            return raw if raw > 0 else None
+        if isinstance(raw, float):
+            if raw.is_integer() and raw > 0:
+                return int(raw)
+            return None
+        if isinstance(raw, str):
+            s = raw.strip()
+            if s.isdigit():
+                n = int(s)
+                return n if n > 0 else None
+            try:
+                f = float(s)
+                if f.is_integer() and f > 0:
+                    return int(f)
+            except ValueError:
+                return None
+        return None
+    if isinstance(node, (exp.Paren, exp.Cast)):
+        return _extract_sql_positive_int(node.this)
+    return None
 
 
 class SqliteClinicalCapability:
@@ -44,7 +103,8 @@ class SqliteClinicalCapability:
             path = path.resolve()
         if not path.is_file():
             raise FileNotFoundError(str(path))
-        conn = sqlite3.connect(str(path), timeout=10.0)
+        # Conexión read-only real a nivel de SQLite
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=10.0)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -79,16 +139,63 @@ class SqliteClinicalCapability:
         raw = (sql or "").strip()
         if not raw:
             return SqlResult(executed_query="", error="consulta vacía")
-        if ";" in raw.rstrip().rstrip(";"):
-            return SqlResult(executed_query=raw, error="una sola sentencia; no uses ';' encadenado")
-        low = raw.lower()
-        if not low.startswith("select") and not low.startswith("with"):
-            return SqlResult(executed_query=raw, error="solo consultas SELECT / WITH … SELECT")
-        if _FORBIDDEN.search(raw):
-            return SqlResult(executed_query=raw, error="palabra clave no permitida en SQL de lectura")
-        bounded = raw.rstrip().rstrip(";")
-        if not re.search(r"\blimit\s+\d+\s*$", low):
-            bounded = f"{bounded} LIMIT {_SQL_MAX_ROWS}"
+
+        try:
+            parsed = sqlglot.parse(raw, read="sqlite")
+            if not parsed:
+                return SqlResult(executed_query=raw, error="consulta SQL no válida")
+            if len(parsed) > 1:
+                return SqlResult(executed_query=raw, error="una sola sentencia; no uses ';' encadenado")
+            
+            ast = parsed[0]
+            if not isinstance(ast, (exp.Select, exp.With)):
+                return SqlResult(executed_query=raw, error="solo consultas SELECT / WITH … SELECT")
+            
+            for node in ast.walk():
+                if isinstance(node, (exp.Update, exp.Delete, exp.Insert, exp.Drop, exp.Create, exp.Alter)):
+                    return SqlResult(executed_query=raw, error="operación mutable (DML/DDL) no permitida")
+
+            allowed_tables = {t.lower() for t in self.list_tables()}
+            cte_names = _cte_aliases(ast)
+            extracted_tables: list[str] = []
+            for t in ast.find_all(exp.Table):
+                t_name = (t.name or "").strip().lower()
+                if not t_name:
+                    continue
+                extracted_tables.append(t_name)
+                if t_name in _SYSTEM_TABLES:
+                    return SqlResult(
+                        executed_query=raw,
+                        error="consulta a tablas de sistema no permitida",
+                    )
+                if t_name in cte_names:
+                    continue
+                if t_name not in allowed_tables:
+                    return SqlResult(
+                        executed_query=raw,
+                        error=f"tabla no permitida: {t_name}",
+                    )
+
+            select_ast = _select_body(ast)
+            if select_ast is None:
+                return SqlResult(executed_query=raw, error="solo consultas SELECT / WITH … SELECT")
+
+            current_limit = settings.sql_max_rows
+            limit_node = select_ast.args.get("limit")
+            if limit_node and limit_node.expression:
+                requested_limit = _extract_sql_positive_int(limit_node.expression)
+                if requested_limit is None:
+                    return SqlResult(
+                        executed_query=raw,
+                        error="LIMIT debe ser un entero positivo literal",
+                    )
+                current_limit = min(requested_limit, settings.sql_max_rows)
+
+            select_ast.set("limit", exp.Limit(expression=exp.Literal.number(current_limit)))
+            bounded = ast.sql(dialect="sqlite")
+
+        except sqlglot.errors.ParseError as e:
+            return SqlResult(executed_query=raw, error=f"error de sintaxis SQL: {e}")
 
         try:
             with self._connect() as conn:
@@ -100,11 +207,12 @@ class SqliteClinicalCapability:
         except Exception as exc:
             return SqlResult(executed_query=bounded, error=str(exc))
 
+        # tables_used contiene las tablas (o CTEs) involucradas 
         return SqlResult(
             executed_query=bounded,
             rows=rows,
             row_count=len(rows),
-            tables_used=[],
+            tables_used=list(set(extracted_tables)),
         )
 
     def extract_clinical_summary(self, free_text_query: str) -> ClinicalContext:
@@ -152,7 +260,7 @@ class SqliteClinicalCapability:
                             "SELECT DISTINCT TRIM(description) AS d FROM conditions "
                             "WHERE TRIM(COALESCE(description, '')) != '' "
                             "ORDER BY d LIMIT ?",
-                            (_CLINICAL_MAX_LIST,),
+                            (settings.clinical_max_list,),
                         )
                         conditions = [str(r[0]) for r in cur.fetchall() if r[0]]
 
@@ -164,7 +272,7 @@ class SqliteClinicalCapability:
                             "SELECT DISTINCT TRIM(description) AS d FROM medications "
                             "WHERE TRIM(COALESCE(description, '')) != '' "
                             "ORDER BY d LIMIT ?",
-                            (_CLINICAL_MAX_LIST,),
+                            (settings.clinical_max_list,),
                         )
                         medications = [str(r[0]) for r in cur.fetchall() if r[0]]
 

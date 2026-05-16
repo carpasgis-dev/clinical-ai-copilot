@@ -22,7 +22,8 @@ RULES:
 - All terms must be in ENGLISH. Translate from Spanish before writing.
 - Maximum 3 AND groups. Each group: 1–3 English phrases in parentheses.
 - Extract keywords ONLY from the clinical question, not from the patient demographics.
-- No Spanish words. No JSON. No labels. No explanation. No period at end. ONE LINE ONLY."""
+- No Spanish words. No JSON. No labels. No explanation. No period at end. ONE LINE ONLY.
+- Do NOT put meta-words like "recent", "new", "novel", or "current" inside quoted phrases: PubMed [tiab] rarely matches them; use concrete clinical terms (e.g. "cardiovascular prevention" not "recent cardiovascular treatment")."""
 
 
 def env_int(name: str, default: int) -> int:
@@ -69,10 +70,24 @@ def pubmed_line_from_llm_text(raw: str) -> str:
     return ""
 
 
+def _strip_recency_meta_in_pubmed_quotes(s: str) -> str:
+    """
+    Quita recent/new/novel/… tras ``( "``, ``AND "`` u ``OR "`` (pocos hits en [tiab]).
+    """
+    if not s:
+        return s
+    mw = r"(?:recent|recently|new|newly|novel|current|currently|emerging|state-of-the-art|state\s+of\s+the\s+art)\s+"
+    out = re.sub(r'(\(\s*")' + mw, r"\1", s, flags=re.I)
+    out = re.sub(r'(\s+AND\s+")' + mw, r"\1", out, flags=re.I)
+    out = re.sub(r'(\s+OR\s+")' + mw, r"\1", out, flags=re.I)
+    return out
+
+
 def refine_llm_pubmed_keywords(line: str, *, max_words: int = 6) -> str:
     """
     Limpia la línea del LLM para evitar 0 hits en PubMed:
     – elimina contexto social/laboral que el modelo copia del expediente
+    – quita meta-palabras (recent, new, …) tras comillas de frases (pocos hits en [tiab])
     – si la query ya tiene paréntesis/AND/OR explícitos (modelo estructurado), la respeta
     – si son palabras sueltas, recorta a máx. `max_words` palabras
     """
@@ -80,6 +95,7 @@ def refine_llm_pubmed_keywords(line: str, *, max_words: int = 6) -> str:
     if not s:
         return ""
     s = re.split(r"[.;]", s, maxsplit=1)[0].strip()
+    s = _strip_recency_meta_in_pubmed_quotes(s)
 
     _noise = [
         r"(?i)\bfull[- ]?time\s+employment\b",
@@ -137,7 +153,7 @@ def coerce_pubmed_line_for_esearch(line: str, *, max_and_words: int = 5) -> str:
     return f"({g1}) AND ({g2})"
 
 
-def sanitize_pubmed_term(s: str, *, max_len: int = 400) -> str:
+def sanitize_pubmed_term(s: str, *, max_len: int = 900) -> str:
     s = " ".join(s.split())
     s = s.strip(' \t\n\r"\'`\u201c\u201d')
     if len(s) > max_len:
@@ -149,7 +165,8 @@ _SPANISH_MARKERS = re.compile(
     r"\b(intervenciones|psicológicas|psicologicas|manejo|estrés|estres|"
     r"dolor|crónico|cronico|musculoesquelético|musculoesqueletico|"
     r"terapia|cognitivo|conductual|aceptación|aceptacion|"
-    r"ansiedad|bienestar|ejercicio|rehabilitación|rehabilitacion)\b",
+    r"ansiedad|bienestar|ejercicio|rehabilitación|rehabilitacion|"
+    r"anticoagulantes|orales|directos|fibrilación|fibrilacion|ictus|hemorrágico|hemorragico)\b",
     re.I,
 )
 

@@ -60,13 +60,36 @@ Este proyecto explora arquitecturas RAG alineadas con la **jerarquía de la Medi
 
 ---
 
-## ✨ Innovaciones Core
+## ✨ ¿Qué hace a este copiloto diferente?
 
-- **Retrieval Policy Engine Declarativo**: Búsqueda adaptativa en PubMed controlada por políticas basadas en PICO (Patient, Intervention, Comparison, Outcome), eliminando el código espagueti procedural.
-- **Ranking Epistémico Multiplicativo**: Modelado explícito de la jerarquía de la evidencia.
-- **Applicability Scoring Demográfico**: Cruce automático entre los metadatos del paciente (ej. geriátrico) y la población del estudio (ej. abstract pediátrico).
-- **Hallucination-Constrained Clinical Synthesis**: Capa de guardarraíles deterministas. El LLM opera a `temperature=0.0` y post-procesa sus respuestas aislando claims sin soporte explícito.
-- **Enrutamiento Híbrido**: Capacidad determinista para decidir si resolver mediante SQL contra la cohorte local, mediante bibliografía externa, o una combinación de ambas.
+Este proyecto no es otro *wrapper* de ChatGPT. Su arquitectura está diseñada desde cero para el rigor clínico, con varias capas de control que no encontrarás en sistemas RAG genéricos:
+
+1.  **Búsqueda Guiada por Relevancia Clínica (PICO)**: En lugar de una simple búsqueda semántica, el sistema primero descompone la pregunta en un esquema PICO (Paciente, Intervención, Comparación, Desenlace). Esto permite construir consultas a PubMed mucho más precisas y ejecutar "escaleras de evidencia" automáticas, que van de lo más específico a lo más general si no se encuentran resultados, manteniendo siempre el control.
+
+2.  **Ranking Epistémico: La Calidad de la Evidencia Importa**: El núcleo del sistema es un motor de ranking que entiende la jerarquía de la evidencia médica. Un Ensayo Clínico Aleatorizado (RCT) siempre tendrá más peso que un estudio preclínico en ratones, incluso si este último es semánticamente más cercano a la pregunta. Esto se implementa con un multiplicador de puntuación basado en el tipo de estudio, previniendo que evidencia débil contamine la respuesta final.
+
+3.  **Filtro de Aplicabilidad Demográfica**: El sistema cruza automáticamente los datos del paciente (ej: "mujer de 72 años") con los de los estudios recuperados. Si un artículo trata sobre pediatría o una población completamente diferente, su puntuación se penaliza, evitando recomendaciones basadas en evidencia no aplicable.
+
+4.  **Síntesis Anti-Alucinaciones**: La generación de la respuesta final está fuertemente restringida. El LLM opera con `temperature=0.0` (máximo determinismo) y sobre un conjunto de "hechos" extraídos de los papers. Un post-proceso verifica que cada afirmación en la respuesta esté directamente respaldada por una cita (PMID), eliminando la invención de información.
+
+5.  **Enrutamiento Híbrido (SQL + RAG)**: El sistema es capaz de decidir de forma autónoma si la pregunta se responde mejor consultando una base de datos de pacientes locales (vía SQL) o buscando en la literatura médica externa (vía RAG), o una combinación de ambas. Esto permite respuestas que integran el contexto local con la evidencia global.
+
+---
+
+## 🩺 Casos de Uso y Consultas de Ejemplo
+
+El sistema está diseñado para resolver escenarios clínicos complejos que combinan el estado de una cohorte local (vía SQL) con la literatura biomédica mundial (vía PubMed/Europe PMC). Algunos ejemplos de consultas que el copiloto comprende y resuelve óptimamente:
+
+- **Riesgo Cardiometabólico (SGLT2 / GLP-1):** 
+  > *"En pacientes con diabetes e hipertensión ≥65 años, ¿qué evidencia hay sobre inhibidores SGLT2 o agonistas GLP-1 frente a solo metformina para reducir eventos cardiovasculares (MACE)?"*
+- **Anticoagulación y Fibrilación Auricular:** 
+  > *"Paciente de nuestra cohorte con diabetes, hipertensión y fibrilación auricular ≥75 años. ¿Qué evidencia existe sobre anticoagulantes orales directos (DOAC) frente a warfarina para prevención de ictus?"*
+- **Protección Renal e Insuficiencia Cardíaca:** 
+  > *"Diabetes y enfermedad renal crónica en la cohorte local: ¿cuál es la evidencia de uso de iSGLT2 en desenlaces renales y cardiovasculares prospectivos?"*
+- **Seguridad y Efectos Adversos:** 
+  > *"En pacientes diabéticos de nuestra cohorte, ¿qué evidencia de alta calidad existe sobre la seguridad clínica de semaglutide respecto a episodios de hipoglucemia?"*
+- **Intersección Híbrida Explícita (SQL + Literatura):** 
+  > *"Usando los pacientes de nuestra base de datos biomédica local y la bibliografía externa actual, ¿qué opciones terapéuticas tienen mejor evidencia para reducir MACE en diabetes tipo 2 con hipertensión?"*
 
 ---
 

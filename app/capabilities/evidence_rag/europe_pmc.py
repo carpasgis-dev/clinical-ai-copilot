@@ -21,13 +21,36 @@ from app.schemas.copilot_state import (
     ArticleSummary,
     ClinicalContext,
     EvidenceBundle,
-
-
 )
 
 EUROPE_PMC_SEARCH = (
     "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 )
+
+
+def _epmc_retrieval_debug(
+    *,
+    outcome: str,
+    term: str = "",
+    errors: list[str] | None = None,
+    articles_parsed: int = 0,
+) -> dict[str, Any]:
+    from app.capabilities.evidence_rag.ncbi.pubmed_query_normalizer import (
+        retrieval_metrics_for_query,
+    )
+
+    return {
+        "outcome": outcome,
+        "backend": "europe_pmc",
+        "attempts": [],
+        "errors": list(errors or []),
+        "final_idlist_length": articles_parsed,
+        "articles_parsed": articles_parsed,
+        "pubmed_query_planned": term,
+        "normalized_query": term,
+        "final_query_sent": term,
+        "retrieval_metrics": retrieval_metrics_for_query(term),
+    }
 
 
 def _pdat_filter_clause(years_back: int) -> str:
@@ -184,10 +207,20 @@ class EuropePmcCapability:
         pubmed_query: str,
         retmax: int = 6,
         years_back: int = 5,
+        *,
+        synthesis_pubtype_refine: bool = True,
     ) -> EvidenceBundle:
         term = (pubmed_query or "").strip()
         if not term:
-            return EvidenceBundle(search_term="", pmids=[], articles=[])
+            return EvidenceBundle(
+                search_term="",
+                pmids=[],
+                articles=[],
+                retrieval_debug=_epmc_retrieval_debug(
+                    outcome="no_query",
+                    errors=["término de búsqueda vacío"],
+                ),
+            )
 
         cap = min(max(retmax, 1), 10, settings.evidence_max_art)
         yb = years_back if years_back and years_back > 0 else 0
@@ -208,8 +241,17 @@ class EuropePmcCapability:
                     page_size=cap,
                     years_back=yb,
                 )
-        except Exception:
-            return EvidenceBundle(search_term=term, pmids=[], articles=[])
+        except Exception as exc:
+            return EvidenceBundle(
+                search_term=term,
+                pmids=[],
+                articles=[],
+                retrieval_debug=_epmc_retrieval_debug(
+                    outcome="error",
+                    term=term,
+                    errors=[str(exc)],
+                ),
+            )
 
         articles: list[ArticleSummary] = []
         pmids: list[str] = []
@@ -239,6 +281,11 @@ class EuropePmcCapability:
             articles=articles,
             chunks_used=0,
             oa_pdfs_retrieved=0,
+            retrieval_debug=_epmc_retrieval_debug(
+                outcome="ok",
+                term=term,
+                articles_parsed=len(articles),
+            ),
         )
 
     def health_check(self) -> bool:

@@ -36,6 +36,8 @@ class StubEvidenceCapability:
         pubmed_query: str,
         retmax: int = 6,
         years_back: int = 5,
+        *,
+        synthesis_pubtype_refine: bool = True,
     ) -> EvidenceBundle:
         term = (pubmed_query or "").strip()[:200] or "(empty)"
         planned = (pubmed_query or "").strip()
